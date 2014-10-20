@@ -37,6 +37,11 @@ Server
 PC client
 ffplay.exe http://server_ip:8090/out.m3u8
 
+test case
+====
+wget -d http://localhost:8090/dir/xx.jpg
+doc/examples/remuxing test.jpg http://localhost:8090/dir/xx.jpg  data
+
 
 [1] http://blog.csdn.net/deyangliu/article/details/39898169
 [2] http://blog.csdn.net/deyangliu/article/details/39187623

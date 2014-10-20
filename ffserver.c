@@ -46,13 +46,13 @@ typedef struct{
 	char info[32];
 }msg_ctl_t;
 static int ctl_id = -1;
-static int ff_ctl_send(long cmd, long chid)
+static int ff_ctl_send(long cmd, char *info)
 {
 	int ret = -1;
 	msg_ctl_t m = {.type = 1, };
 	m.cmd = cmd;
-	m.para[0] = chid;
-	sprintf(m.info, "%lu.m3u8", chid);
+	sscanf(info, "%ld", &m.para[0]);
+	sprintf(m.info, "%s", info);
 
 	ret = msgsnd(ctl_id, &m, sizeof(msg_ctl_t)-sizeof(long), IPC_NOWAIT);
 	return ret;
@@ -84,7 +84,7 @@ typedef struct{
 }SFF;
 
 typedef enum {
-    HTTPSTATE_WAIT_REQUEST,
+    HTTPSTATE_WAIT_REQUEST = 1,
     HTTPSTATE_SEND_HEADER,
     HTTPSTATE_SEND_DATA_HEADER,
     HTTPSTATE_SEND_DATA,  /* sending TCP or UDP data */
@@ -123,10 +123,16 @@ typedef struct HTTPContext {
 	SFF *sff; /*current incomple pkt*/
 	SFF *sff_pkts[N+1]; 
 	int sff_w;
+	int sff_ref_cnt; /*being quotied count*/
 	/*reader specific*/
-	struct HTTPContext *feed_ctx;
+	struct HTTPContext *feed_ctx; /*data source*/
 	int sff_r;
 } HTTPContext;
+
+typedef struct{/*extra data not in HTTPContext*/
+	char domain[64];
+	char cookie[512];
+}RequestData;
 
 static struct sockaddr_in my_http_addr;
 static HTTPContext *first_http_ctx;
@@ -169,7 +175,7 @@ static int hls_close(void)
 	return 0;		
 }
 
-static int hls_parse_request(HTTPContext *c, char *name)
+static int hls_parse_request(HTTPContext *c, char *name, int is_first)
 {
 	int idx = -1, ret = 0;
 	char *ext = NULL;
@@ -225,7 +231,7 @@ static int hls_parse_request(HTTPContext *c, char *name)
 	
 		ret = 0;
 	}else{/*reader*/
-		if((S == idx) && strncmp(s_hls_name, name, ext-name) ){
+		if(is_first && (S == idx) && strncmp(s_hls_name, name, ext-name) ){
 			hls_close();
 			strncpy(s_hls_name, name, ext - name);
 			s_hls_name[ext - name] = 0; 
@@ -320,7 +326,12 @@ static void sff_free(SFF **s)
 static void sff_reset(HTTPContext *c)
 {
 	int i;
-	if(!(c && c->post)){
+	if(!c){
+		printf("bad arg in reset\n");
+		return;
+	}
+	if(!c->post){
+		if(c->feed_ctx)c->feed_ctx->sff_ref_cnt--;
 		return;
 	}
 
@@ -373,7 +384,7 @@ static int sff_write(HTTPContext *c, SFF *sff)
 		c->sff_w = (c->sff_w + 1)%N;
 	}
 	sff_dump(sff);
-
+	sff->wflag = 2; /*now reader can read*/
 	return 0;
 }
 
@@ -382,9 +393,13 @@ static SFF* sff_read(HTTPContext *c, int type)
 	HTTPContext *f = c->feed_ctx;
 	SFF *sff = NULL;
 	int idx = 1 == type ? N : c->sff_r;
+
+	if(!f){
+		return NULL;
+	}
 	
 	sff = f->sff_pkts[idx];
-	if(!(sff && sff->wflag == 0)){
+	if(!(sff && sff->wflag == 2)){
 		return NULL;
 	}
 	
@@ -424,14 +439,18 @@ static int sff_parse(SFF *sff, AVPacket *pkt)
 
 static int wake_others(HTTPContext *c, int to)
 {
-	HTTPContext *c1 = NULL;
+	HTTPContext *c2 = NULL;
 
-	for(c1 = first_http_ctx; c1 != NULL; c1 = c1->next) {
-		if (c1->state == HTTPSTATE_WAIT_FEED){
-			if(c1->feed_ctx == c)
-				c1->state = to;
-			if(c->hls_idx >= 0 && c->hls_idx == c1->hls_idx)
-				c1->state = to;
+	for(c2 = first_http_ctx; c2 != NULL; c2 = c2->next) {
+		if (c2->state == HTTPSTATE_WAIT_FEED){
+			if(!c2->feed_ctx && !c2->post && !strcmp(c2->url, c->url)){
+				c2->feed_ctx = c;
+				c->sff_ref_cnt++;
+			}
+			if(c2->feed_ctx == c)
+				c2->state = to;
+			if(c->hls_idx >= 0 && c->hls_idx == c2->hls_idx)
+				c2->state = to;
 		}
 	}
 	return 0;
@@ -441,7 +460,7 @@ static int wake_others(HTTPContext *c, int to)
 
 static int http_receive_data(HTTPContext *c)
 {
-	int len = 0, len0 = 0, found = 0, ret = 0;
+	int len = 0, len0 = 0, trans = 0, ret = 0;
 	uint8_t *ptr = NULL, buf[8] = "";
 	uint32_t type = 0, size = 0;
 	SFF *sff = c->sff;
@@ -459,7 +478,7 @@ static int http_receive_data(HTTPContext *c)
 		goto check;
 	}
 
-	/*get remains, fail indicate network error*/	
+	/*get remains*/	
 	if(sff && sff->size && sff->wpos < sff->size){
 		len0 = sff->size - sff->wpos;
 		len = recv(c->fd, sff->data + sff->wpos, len0, 0);
@@ -467,10 +486,8 @@ static int http_receive_data(HTTPContext *c)
 		if(len == len0){
 			sff_write(c, sff);
 			c->sff = NULL;	
-		}else{
-			printf("sff bad data\n");
-			return -1;
 		}
+		goto check;
 	}
 	if(c->sff){
 		printf("sff internal error\n");
@@ -478,7 +495,7 @@ static int http_receive_data(HTTPContext *c)
 	}
 
 	ptr = buf;	
-	/*sync to next pkt, drop any data before it*/
+	/*sync to current pkt, drop any data between last pkt and current pkt*/
 	while( (len = recv(c->fd, ptr, 1, 0)) > 0){
 		if(*ptr != 'S')continue; 
 		recv(c->fd, ptr, 1, 0);
@@ -498,7 +515,11 @@ static int http_receive_data(HTTPContext *c)
 		sff->size = size;
 		sff->data = av_malloc(sff->size);
 		len = recv(c->fd, sff->data, sff->size, 0);
-		sff->wpos = len;	
+		if(len > 0)sff->wpos = len;	
+		if(sff->size && sff->wpos == sff->size){
+			sff_write(c, sff);
+			c->sff = NULL;	
+		}
 		break;
 	}
 
@@ -511,23 +532,24 @@ check:
 			//printf("hls get seg %d:%d:%d data %02x %02x %02x %02x\n", c->hls_idx, s->msize, s->csize, s->data[0], s->data[1], s->data[2], s->data[3]);
 		}
 		wake_others(c, HTTPSTATE_SEND_DATA_TRAILER); 
-		return -1;
+		if(s || (c->sff_ref_cnt <= 0))return -1;
 	}
 
 	if(s && s->csize > 0){/*get partial data, also send notify.*/
-		found = 1;
+		trans = HTTPSTATE_SEND_DATA; 
 	}
 	/*get full pkt, add it to cbuf*/
-	else if(c->sff && sff->size && sff->wpos == sff->size){
-		sff_write(c, sff);
-		c->sff = NULL;	
-		if(2 == sff->type){//todo:wait more?
-			found = 1;
+	else if(sff && sff->size && sff->wpos == sff->size){
+		if(1 == sff->type){
+			trans = HTTPSTATE_SEND_DATA_HEADER;
+		}
+		else if(2 == sff->type){
+			trans = HTTPSTATE_SEND_DATA; 
 		}
 	}
 	
 	/* wake up any waiting connections */
-	if(found)wake_others(c, HTTPSTATE_SEND_DATA);
+	if(trans)wake_others(c, trans);
 	return 0;
 }
 
@@ -821,16 +843,16 @@ static void new_connection(int server_fd, int is_rtsp)
 
 static void close_connection(HTTPContext *c)
 {
-    HTTPContext **cp, *c1;
+    HTTPContext **cp, *c2;
 
     /* remove connection from list */
     cp = &first_http_ctx;
     while ((*cp) != NULL) {
-        c1 = *cp;
-        if (c1 == c)
+        c2 = *cp;
+        if (c2 == c)
             *cp = c->next;
         else
-            cp = &c1->next;
+            cp = &c2->next;
     }
 
     /* remove connection associated resources */
@@ -931,8 +953,16 @@ static int handle_connection(HTTPContext *c)
         break;
     case HTTPSTATE_RECEIVE_DATA:
         /* no need to read if no events */
-        if (c->poll_entry->revents & (POLLERR | POLLHUP))
+        if (c->poll_entry->revents & (POLLERR | POLLHUP)){
+			HLS *s = NULL;
+			if(c->hls_idx >= 0){
+				s = &s_hls[c->hls_idx];
+				s->flag = 2;
+			}
+				
+			wake_others(c, HTTPSTATE_SEND_DATA_TRAILER); 
             return -1;
+        }
         if (!(c->poll_entry->revents & POLLIN))
             return 0;
         if (http_receive_data(c) < 0)
@@ -978,7 +1008,7 @@ static void skip_spaces(const char **pp)
     *pp = p;
 }
 
-static void get_word(char *buf, int buf_size, const char **pp)
+static int get_word(char *buf, int buf_size, const char **pp)
 {
     const char *p;
     char *q;
@@ -994,80 +1024,111 @@ static void get_word(char *buf, int buf_size, const char **pp)
     if (buf_size > 0)
         *q = '\0';
     *pp = p;
+	return q - buf;
 }
 
+static int get_line(char *buf, int buf_size, const char **pp)
+{
+	const char *p = *pp;
+	char *q = buf;
+
+	while(*p && (*p == '\r' || *p == '\n')){
+		p++;
+	}
+	while(*p && !(*p == '\r' || *p == '\n')){
+		if(q - buf < buf_size - 1)*q++ = *p++;	
+	}
+	*q = 0;
+	*pp = p;
+	return q - buf;
+}
+
+static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *rd)
+{
+	char *p1, tmp[32], info[32];
+	const char *p = line;
+	int len;
+	
+	get_word(tmp, sizeof(tmp), &p);
+	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST")){
+		if (tmp[0]== 'G')
+			c->post = 0;
+		else if (tmp[0] == 'P')
+			c->post = 1;
+		else
+			return -1;
+
+		get_word(c->url, sizeof(c->url), &p);
+		if(c->url[0] == '/'){
+			len = strlen(c->url)-1;
+			memmove(c->url, c->url+1, len); 
+			c->url[len] = 0;
+		}
+
+		get_word(tmp, sizeof(tmp), &p);
+		if (strcmp(tmp, "HTTP/1.0") && strcmp(tmp, "HTTP/1.1"))
+			return -1;
+
+		p1 = strchr(c->url, '?');
+		if (p1) {
+			av_strlcpy(info, p1, sizeof(info));
+			*p1 = '\0';
+		} else
+			info[0] = '\0';
+	}
+	else if(!strcmp(tmp, "Host:")){
+		get_word(rd->domain, sizeof(rd->domain), &p);	
+	}
+	else if(!strcmp(tmp, "Cookie:")){
+		get_word(rd->cookie, sizeof(rd->cookie), &p);
+	}
+	return 0;
+}
 
 /* parse HTTP request and prepare header */
 static int http_parse_request(HTTPContext *c)
 {
-    const char *p;
-    char *p1;
-    char cmd[16], protocol[16];
-    char info[32], filename[32];
-    char url[64], *q;
-    char msg[1024];
-    const char *mime_type;
+    char *q, msg[1024];
+    const char *mime_type, *p;
 	HTTPContext *ctx;
-	int ret = 0;
+	int ret = 0, is_first = 0;
+	const char *first_tag = "First-Request=0";
+	RequestData rd = {{0}};
 
     p = c->buffer;
-    get_word(cmd, sizeof(cmd), &p);
-	
-    if (!strcmp(cmd, "GET"))
-        c->post = 0;
-    else if (!strcmp(cmd, "POST"))
-        c->post = 1;
-    else
-        return -1;
+	while(get_line(msg, sizeof(msg), &p) > 0){
+		ret = handle_line(c, msg, sizeof(msg), &rd);
+		if(ret < 0)return ret;
+	}
+	is_first = !av_stristr(rd.cookie, first_tag);
 
-    get_word(url, sizeof(url), &p);
-    av_strlcpy(c->url, url, sizeof(c->url));
-
-    get_word(protocol, sizeof(protocol), (const char **)&p);
-    if (strcmp(protocol, "HTTP/1.0") && strcmp(protocol, "HTTP/1.1"))
-        return -1;
-
-    //http_log("New conn: %s:%u %s %s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), cmd, url);
-
-    /* find the filename and the optional string in the request */
-    p1 = strchr(url, '?');
-    if (p1) {
-        av_strlcpy(info, p1, sizeof(info));
-        *p1 = '\0';
-    } else
-        info[0] = '\0';
-
-    av_strlcpy(filename, url + ((*url == '/') ? 1 : 0), sizeof(filename)-1);
+    //http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
 
 	/*handle m3u8/ts request solely*/
-	if(av_match_ext(filename, "m3u8") 
-			|| av_match_ext(filename, "ts")){
-		ret = hls_parse_request(c, filename);
+	if(av_match_ext(c->url, "m3u8") 
+			|| av_match_ext(c->url, "ts")){
+		ret = hls_parse_request(c, c->url, is_first);
 		if(ret < 0)goto send_error;
 		else if(ret == 1){
-			long chid = atoi(filename);
+			long chid = atoi(c->url);
 			if(!(0 <= chid && chid <= 10000)){
-				sprintf(msg, "bad request: %s-->%ld", filename, chid);
+				sprintf(msg, "bad request: %s-->%ld", c->url, chid);
 				http_log("%s\n", msg);
 				goto send_error;
 			}
-			
-			ff_ctl_send(1, chid);
-			
-			http_log("wait get %s\n", filename);
+			ff_ctl_send(1, c->url);
+			http_log("wait get %s\n", c->url);
 		}
-
 		if(c->state == HTTPSTATE_SEND_HEADER)
 			goto send_header;
-
 		return 0; /*end here*/
 	}
 
     /*handle feed request*/
     if (c->post) {
-		ctx = find_feed(url);
+		ctx = find_feed(c->url);
 		if(ctx && ctx != c){
-			sprintf(msg, "file %s has been feeded\n", filename);
+			sprintf(msg, "file %s has been feeded\n", c->url);
 			http_log("%s", msg);
 			goto send_error;
 		}
@@ -1075,13 +1136,15 @@ static int http_parse_request(HTTPContext *c)
         c->state = HTTPSTATE_RECEIVE_DATA;
         return 0; /*end here*/
 	}else{
-		ctx = find_feed(url);
+		ctx = find_feed(c->url);
 		if(!ctx){
-			sprintf(msg, "file %s is not feed\n", filename);
+			sprintf(msg, "wait to get %s\n", c->url);
 			http_log("%s", msg);
-			goto send_error;
+			ff_ctl_send(2, c->url); 
+		}else{
+			ctx->sff_ref_cnt++;
 		}
-		c->feed_ctx = ctx;
+		c->feed_ctx = ctx; 
 	}
 
 send_header:
@@ -1090,9 +1153,8 @@ send_header:
     av_strlcatf(c->buffer, c->buffer_size, "HTTP/1.0 200 OK\r\n");
     mime_type = "application/x-octet-stream";
     av_strlcatf(c->buffer, c->buffer_size, "Pragma: no-cache\r\n");
-
-    /* for asf, we need extra headers */
     av_strlcatf(c->buffer, c->buffer_size, "Content-Type: %s\r\n", mime_type);
+	av_strlcatf(c->buffer, c->buffer_size, "Set-Cookie: %s; Path=/; Domain=%s\r\n", first_tag, rd.domain);
     av_strlcatf(c->buffer, c->buffer_size, "\r\n");
 
     q = c->buffer + strlen(c->buffer);
@@ -1105,7 +1167,7 @@ send_header:
 	
 	if(S == c->hls_idx){
 		HLS *s = &s_hls[c->hls_idx];
-		char *ext = strrchr(filename, '.');
+		char *ext = strrchr(c->url, '.');
 		if(!(2 == s->flag && s->data && s->csize > 0)){/*not exist yet, fake one*/
 			c->http_error = 200;
 			c->buffer_end += sprintf(c->buffer_end, 
@@ -1114,7 +1176,7 @@ send_header:
 				"#EXT-X-TARGETDURATION:2\n"
 				"#EXT-X-MEDIA-SEQUENCE:0\n"
 				"#EXTINF:1.283989,\n"
-				"%.*s0.ts\n", ext - filename, filename);
+				"%.*s0.ts\n", ext - c->url, c->url);
 		}
 	}
     return 0;
@@ -1139,7 +1201,7 @@ send_header:
 }
 
 
-static int http_prepare_data(HTTPContext *c)
+static int sff_prepare_data(HTTPContext *c)
 {
 	SFF *sff = NULL;  
 	AVPacket pkt = {0};
@@ -1149,6 +1211,7 @@ static int http_prepare_data(HTTPContext *c)
 		sff = sff_read(c, 1);
 		if(!sff){
 			printf("prepare no sff\n");
+			c->state = HTTPSTATE_WAIT_FEED;
 			return 1;
 		}
 		c->buffer_ptr = sff->data;
@@ -1194,7 +1257,7 @@ static int http_send_data(HTTPContext *c)
 
     for(;;) {
         if (c->buffer_ptr >= c->buffer_end) {
-            ret = c->hls_idx >= 0 ? hls_read(c) : http_prepare_data(c);
+            ret = c->hls_idx >= 0 ? hls_read(c) : sff_prepare_data(c);
             if (ret < 0)
                 return -1;
             else if (ret != 0)

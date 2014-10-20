@@ -70,7 +70,7 @@ int sff_write_header(AVFormatContext *ctx)
 {
 	uint32_t size = 0; 
 	uint8_t *buf = NULL;
-	int ret = -1;
+	int ret = 0;
 	AVIOContext *pb = NULL, *old = ctx->pb;
 	if(!ctx ){
 		return -1;
@@ -86,7 +86,8 @@ int sff_write_header(AVFormatContext *ctx)
 		
 	size = avio_close_dyn_buf(ctx->pb, &buf);
 	ctx->pb = old;
-	ret = sff_write_block(ctx->pb, 1, buf, size);
+	if(size > 0)
+		ret = sff_write_block(ctx->pb, 1, buf, size);
 	av_freep(&buf);	
 	return ret;
 }
