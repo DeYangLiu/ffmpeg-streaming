@@ -16,7 +16,7 @@
 #define RB16(buf) ({uint16_t tmp = AV_RB16(buf); buf += 2; tmp;})
 #define R8(buf) ({uint8_t tmp = *buf; buf += 1; tmp;})
 
-
+#define HEADER_SIZE (8*1024)
 
 
 static int header_write(AVFormatContext *s, uint8_t *pb, uint32_t size)
@@ -44,8 +44,12 @@ static int header_write(AVFormatContext *s, uint8_t *pb, uint32_t size)
 		WB32(pb, st->time_base.den);
 
         codec = st->codec;
+		if(AV_CODEC_ID_NONE == codec->codec_id){
+			printf("no code id\n");
+			return 0;
+		}
         /* generic info */
-		printf("header codec_id %x flags %x extra size %d\n",  codec->codec_id, codec->flags, codec->extradata_size);
+		printf("header codec_id %x flags %x extra size %d gop %d\n",  codec->codec_id, codec->flags, codec->extradata_size, codec->gop_size);
 		if(codec->extradata_size > 0){
 			codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
 		}
@@ -58,8 +62,13 @@ static int header_write(AVFormatContext *s, uint8_t *pb, uint32_t size)
         WB32(pb, codec->debug);
 		
         if (codec->flags & CODEC_FLAG_GLOBAL_HEADER) {
+			if(pb + codec->extradata_size - pb0 > size - 57*4){
+				printf("write too large size %u\n", codec->extradata_size);
+				return 0;
+			}
             WB32(pb, codec->extradata_size);
             memcpy(pb, codec->extradata, codec->extradata_size);
+			pb += codec->extradata_size;
         }
         /* specific info */
         switch(codec->codec_type) {
@@ -133,11 +142,9 @@ static int header_read(AVFormatContext *s, uint8_t *pb, uint32_t size)
     RB32(pb); /* total bitrate */
     /* read each stream */
     for(i=0;i<nb_streams;i++) {
-        char rc_eq_buf[128];
-
         st = avformat_new_stream(s, NULL);
         if (!st){
-            return 0;
+            goto fail;
         }
 		
 		st->pts_wrap_bits = RB32(pb);
@@ -152,11 +159,21 @@ static int header_read(AVFormatContext *s, uint8_t *pb, uint32_t size)
         codec->flags = RB32(pb);
         codec->flags2 = RB32(pb);
         codec->debug = RB32(pb);
+
+		if(AV_CODEC_ID_NONE == codec->codec_id){
+			printf("read no code id\n");
+			goto fail;
+		}
 		
 		if (codec->flags & CODEC_FLAG_GLOBAL_HEADER) {
 			tmp32 = RB32(pb);
+			if(pb + tmp32 - pb0 > size - 57*4){
+				printf("read too large size %u\n", tmp32);
+				goto fail;
+			}
 		    ret = ff_alloc_extradata(codec, tmp32);
 			memcpy(codec->extradata, pb, tmp32);
+			pb += tmp32;
 			printf("header codec_id %x flags %x extra size %d\n",  codec->codec_id, codec->flags,  codec->extradata_size);
         }
         /* specific info */
@@ -219,51 +236,88 @@ static int header_read(AVFormatContext *s, uint8_t *pb, uint32_t size)
             codec->frame_size = RB16(pb);
             break;
         default:
-			return 0;
+			goto fail;
             break;
         }
     }
 
     return pb - pb0;
+fail:
+	for(i = s->nb_streams - 1; i >= 0; --i){
+		ff_free_stream(s, s->streams[i]);
+	}
+	return 0;
 }
 
 int ff_header_write(AVFormatContext *s, const char *name, int postfix)
 {
-	unsigned char buf[1024] = "";
+	unsigned char *buf = NULL;
 	char full_name[128] = "";
 	int len = 0;
 	FILE *fp = NULL;
-	len = header_write(s, buf, sizeof(buf));
+
+	if(s->nb_streams < 1){
+		printf("no streams\n");
+		return 0;
+	}
+
+	buf = malloc(HEADER_SIZE);
+	if(!buf){
+		printf("cant malloc\n");
+		return 0;
+	}
+	memset(buf, 0, HEADER_SIZE);
+	
+	len = header_write(s, buf, HEADER_SIZE);
 	if(len <= 0){
-		return -1;
+		len = 0;
+		goto fail;
 	}
 
 	sprintf(full_name, "/var/ffh.%s.%d", name, postfix);
 	fp = fopen(full_name, "wb");
-	if(!fp || !len)return 0;
+	if(!fp){
+		len = 0;
+		goto fail;
+	}
 
-	
 	fwrite(buf, 1, len, fp);
 	fclose(fp);
-
+fail:
+	free(buf);
 	return len;
 }
 
 int ff_header_read(AVFormatContext *s, const char *name, int postfix)
 {
-	unsigned char buf[1024] = "";
+	unsigned char *buf = NULL;
 	char full_name[128] = "";
 	int len = 0;
 	FILE *fp = NULL;
 
+	if(s->nb_streams > 0){
+		printf("already nb_streams %d\n", s->nb_streams);
+		return 0;
+	}
+
+	buf = malloc(HEADER_SIZE);
+	if(!buf){
+		printf("cant malloc\n");
+		return 0;
+	}
+	memset(buf, 0, HEADER_SIZE);
+
 	sprintf(full_name, "/var/ffh.%s.%d", name, postfix);
 	fp = fopen(full_name, "rb");
-	if(!fp)return 0;
-	len = fread(buf, 1, sizeof(buf), fp);
+	if(!fp){
+		free(buf);
+		return 0;
+	}
+	len = fread(buf, 1, HEADER_SIZE, fp);
 	fclose(fp);
 	
-	len = header_read(s, buf, len);
+	len = header_read(s, buf, HEADER_SIZE);
 
-	return len;
-	
+	free(buf);
+	return len;	
 }
