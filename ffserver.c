@@ -107,6 +107,7 @@ typedef struct HTTPContext {
     char url[64];
 	int post;
 	int http_error;
+	int keep_alive;
 	int64_t data_count;
     int last_packet_sent; /* true if last data packet was sent */
 	
@@ -156,6 +157,90 @@ static int64_t cur_time;
 
 static FILE *logfile = NULL;
 static void http_log(const char *fmt, ...);
+
+#if 1
+
+static int is_static_file(char *name)
+{/*static file is defined as whose content-length can be directly set by ffserver.*/
+	static char* a[] = {
+		"ProgList.htm",
+	};
+	int i;
+
+	if(av_match_ext(name, "m3u8") || av_match_ext(name, "ts")){
+		return 0;
+	}
+	
+	for(i = 0; i < sizeof(a)/sizeof(a[0]); ++i){
+		if(!av_strcasecmp(name, a[i]))return 0;
+	}
+
+	return 1;
+}
+
+static char* get_mine_type(char *name)
+{
+	int i, n;
+	
+	static char* mm[][2] = {
+		".htm", "text/html",
+		".m3u8", "text/plain",
+		"", "application/octet-stream",
+	};
+
+	n = sizeof(mm)/sizeof(mm[0]);
+	for(i = 0; i < n; ++i){
+		if(av_stristr(name, mm[i][0]))break;
+	}
+	if(i >= n)i = n -1;
+
+	return mm[i][1];
+}
+
+
+static int prepare_local_file(HTTPContext *c)
+{/*return 1 if local file exist and can be read to buffer.*/
+    int len;
+	unsigned char tmp[64] = "";
+	char prefix[32] = ".";
+	int fd = -1;
+	struct stat st = {0};
+
+	snprintf(tmp, sizeof(tmp)-1, "%s/%s",  prefix, c->url);
+	fd = open(tmp, O_RDONLY);
+	if(fd < 0){
+		return 0;
+	}
+	if((fstat(fd, &st) < 0) || (st.st_size > SIZE_MAX)){
+		return 0;
+	}
+	
+	c->pb_buffer = av_malloc(1024 + st.st_size);
+	if(!c->pb_buffer){
+        c->buffer_ptr = c->buffer;
+        c->buffer_end = c->buffer;
+		close(fd);
+		return 0;
+	}
+	
+	len = sprintf(c->pb_buffer, "HTTP/1.0 200 OK\r\n"
+			"Content-type: %s\r\n"
+			"Content-Length: %u\r\n"
+			"Connection: %s\r\n"
+			"\r\n", 
+			get_mine_type(c->url),
+			(unsigned int)st.st_size, 
+			(c->keep_alive ? "keep-alive" : "close") );
+
+	len += read(fd, c->pb_buffer + len, st.st_size);
+	close(fd);
+
+    c->buffer_ptr = c->pb_buffer;
+    c->buffer_end = c->pb_buffer + len;
+	return 1;
+}
+
+#endif 
 
 #if 1 //ludi add
 
@@ -703,7 +788,7 @@ static int http_server(void)
 
         /* wait for events on each HTTP handle */
         c = first_http_ctx;
-        delay = 1000;
+        delay = 800;
         while (c != NULL) {
             int fd;
             fd = c->fd;
@@ -890,7 +975,7 @@ static int handle_connection(HTTPContext *c)
                 ff_neterrno() != AVERROR(EINTR))
                 return -1;
         } else if (len == 0) {
-            return -1;
+            if(!c->keep_alive)return -1;
         } else {
             /* search for end of request. */
             uint8_t *ptr;
@@ -927,6 +1012,15 @@ static int handle_connection(HTTPContext *c)
             c->data_count += len;
             if (c->buffer_ptr >= c->buffer_end) {
                 av_freep(&c->pb_buffer);
+				if(c->keep_alive){
+					c->buffer_ptr = c->buffer;
+				    c->buffer_end = c->buffer + c->buffer_size - 1; 
+					c->timeout = cur_time + HTTP_REQUEST_TIMEOUT;
+				    c->state = HTTPSTATE_WAIT_REQUEST;
+					c->hls_idx = -1;
+					http_log("%u alive %s\n", ntohs(c->from_addr.sin_port), c->url);
+					return 0;
+				}
                 /* if error, exit */
                 if (c->http_error)
                     return -1;
@@ -1064,6 +1158,9 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 			memmove(c->url, c->url+1, len); 
 			c->url[len] = 0;
 		}
+		if(!c->url[0]){
+			av_strlcpy(c->url, "index.html", sizeof(c->url));
+		}
 
 		get_word(tmp, sizeof(tmp), &p);
 		if (strcmp(tmp, "HTTP/1.0") && strcmp(tmp, "HTTP/1.1"))
@@ -1081,6 +1178,12 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	}
 	else if(!strcmp(tmp, "Cookie:")){
 		get_word(rd->cookie, sizeof(rd->cookie), &p);
+	}
+	else if(!strcmp(tmp, "Connection:")){
+		get_word(info, sizeof(info), &p);
+		if(!av_strcasecmp(info, "keep-alive")){
+			c->keep_alive = is_static_file(c->url);
+		}
 	}
 	return 0;
 }
@@ -1128,18 +1231,24 @@ static int http_parse_request(HTTPContext *c)
     if (c->post) {
 		ctx = find_feed(c->url);
 		if(ctx && ctx != c){
-			sprintf(msg, "file %s has been feeded\n", c->url);
-			http_log("%s", msg);
+			sprintf(msg, "file %s has been feeded", c->url);
+			http_log("%s\n", msg);
 			goto send_error;
 		}
         c->http_error = 0;
         c->state = HTTPSTATE_RECEIVE_DATA;
         return 0; /*end here*/
 	}else{
+		if(prepare_local_file(c) > 0){
+			c->http_error = 200;
+			c->state = HTTPSTATE_SEND_HEADER;
+			return 0; /*no need feed, send local files directly.*/
+		}
+		
 		ctx = find_feed(c->url);
 		if(!ctx){
-			sprintf(msg, "wait to get %s\n", c->url);
-			http_log("%s", msg);
+			sprintf(msg, "wait to get %s", c->url);
+			http_log("%s\n", msg);
 			ff_ctl_send(2, c->url); 
 		}else{
 			ctx->sff_ref_cnt++;
@@ -1151,7 +1260,7 @@ send_header:
     /* prepare HTTP header */
     c->buffer[0] = 0;
     av_strlcatf(c->buffer, c->buffer_size, "HTTP/1.0 200 OK\r\n");
-    mime_type = "application/x-octet-stream";
+	mime_type =  get_mine_type(c->url);
     av_strlcatf(c->buffer, c->buffer_size, "Pragma: no-cache\r\n");
     av_strlcatf(c->buffer, c->buffer_size, "Content-Type: %s\r\n", mime_type);
 	av_strlcatf(c->buffer, c->buffer_size, "Set-Cookie: %s; Path=/; Domain=%s\r\n", first_tag, rd.domain);
