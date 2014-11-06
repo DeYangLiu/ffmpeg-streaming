@@ -80,6 +80,7 @@ typedef struct HLSContext {
 
     AVIOContext *pb;
 	int drop_cnt; //ludi add
+	int first_key_found;
 } HLSContext;
 
 static int hls_mux_init(AVFormatContext *s)
@@ -224,12 +225,15 @@ static int hls_start(AVFormatContext *s)
     c->number++;
 
     if ((err = avio_open2(&oc->pb, oc->filename, AVIO_FLAG_WRITE,
-                          &s->interrupt_callback, &out_opts)) < 0)
+                          &s->interrupt_callback, &out_opts)) < 0){
+        av_dict_free(&out_opts);
         return err;
+    }
 
     if (oc->oformat->priv_class && oc->priv_data)
         av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
 
+	 av_dict_free(&out_opts);
     return 0;
 }
 
@@ -328,10 +332,18 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     int is_ref_pkt = 1;
     int ret, can_split = 1;
 
-	if(hls->drop_cnt < 12){
-		hls->drop_cnt++;
-		return 0;
+	#if 1
+	if(!hls->first_key_found){
+		if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO)hls->drop_cnt++;
+		can_split = st->codec->codec_type == AVMEDIA_TYPE_VIDEO && pkt->flags & AV_PKT_FLAG_KEY;
+		if(can_split){
+			hls->first_key_found = 1;
+			printf("hlsenc drop %d pts %lld\n", hls->drop_cnt, pkt->pts);
+		}else{
+			return 0;
+		}
 	}
+	#endif
 
     if (hls->start_pts == AV_NOPTS_VALUE) {
         hls->start_pts = pkt->pts;
