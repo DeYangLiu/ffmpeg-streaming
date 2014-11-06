@@ -11,13 +11,10 @@
 #include "avio_internal.h"
 
 #define MAX_PES_HEADER_SIZE 19 
-#define MAX_PES_PAYLOAD_SIZE (256*1024)
+#define MAX_PES_PAYLOAD_SIZE (512*1024)
 typedef struct{
 	AVClass *class; /*for priv_class.option, must be first*/
 	enum AVCodecID codec_id; /*AV_CODEC_ID_XX*/
-	int64_t last_dts; /*dts of last video pes*/
-	int64_t last_pts; /*pts of last video pes*/
-	int64_t ts_offset[2];
 }PesContext;
 
 static int is_pes_start_code(int32_t code)
@@ -56,18 +53,21 @@ static int pes_read_header(AVFormatContext *s)
     PesContext *pes = s->priv_data;
     AVStream *st = NULL;
 
-	if(pes->codec_id != AV_CODEC_ID_NONE){
+	if(!s->nb_streams && pes->codec_id != AV_CODEC_ID_NONE){
 	    st = avformat_new_stream(s, NULL);
 	    if (!st)
 	        return AVERROR(ENOMEM);
 	    st->codec->codec_type = pes->codec_id >= AV_CODEC_ID_MP2 ? AVMEDIA_TYPE_AUDIO : AVMEDIA_TYPE_VIDEO;
 		st->codec->codec_id = pes->codec_id;
-	
-		st->need_parsing  =  AVSTREAM_PARSE_HEADERS;
+	}
+
+	if(1 == s->nb_streams){
+		s->streams[0]->need_parsing  = AVSTREAM_PARSE_HEADERS; 
+	}else{
+		av_log(NULL, AV_LOG_ERROR, "nb_streams %d\n", s->nb_streams);
+		return AVERROR_INVALIDDATA;
 	}
 	
-	pes->last_pts = pes->last_dts = AV_NOPTS_VALUE; 
-	pes->ts_offset[0] = pes->ts_offset[1] = 0;
     return 0;
 }
 
@@ -129,7 +129,7 @@ static int pes_read_packet(AVFormatContext *s, AVPacket *pkt)
 	PesContext *pes = s->priv_data;
 	AVIOContext *pb = s->pb;
 	int64_t delta, pos = 0,  size = MAX_PES_PAYLOAD_SIZE;
-	int64_t pts = pes->last_pts, dts = pes->last_dts;
+	int64_t pts = AV_NOPTS_VALUE, dts = AV_NOPTS_VALUE;
 	int32_t code = 0;
 	int ret = 0,  header_size = 0, pes_header_size = 0, remains = 0, tmp = 0;
 	int total_size = 0;
@@ -179,37 +179,12 @@ _end:
 	}else{
 		av_log(NULL, AV_LOG_ERROR, "pes internal error\n");
 	}
-
-	#if 1
-	if(dts < pes->last_dts){
-		delta = pes->last_dts - dts;
-		if(1E5 <= delta  && delta < (1LL<<(st->pts_wrap_bits-1)) ){
-			av_log(NULL, AV_LOG_WARNING, "jump delta0 %lld\n", delta);
-			pes->ts_offset[0] += delta;
-		}
-	}
-
-	if(pts < pes->last_pts){
-		delta = pes->last_pts - pts;
-		if(1E5 <= delta  && delta < (1LL<<(st->pts_wrap_bits-1)) ){
-			av_log(NULL, AV_LOG_WARNING, "jump delta1 %lld\n", delta);
-			pes->ts_offset[1] += delta;
-		}
-	}
-	
-	if(pes->ts_offset[1] < pes->ts_offset[0]){
-		pes->ts_offset[1] = pes->ts_offset[0];
-	}
-	#endif
-
-	pes->last_dts = dts;
-	pes->last_pts = pts;
 	
 	if(AVSTREAM_PARSE_NONE == st->need_parsing)
 		pkt->flags = AV_PKT_FLAG_KEY; /*let hlsenc can_split*/
 	pkt->stream_index = 0;
-	pkt->dts = dts + pes->ts_offset[0];
-	pkt->pts = pts + pes->ts_offset[1];
+	pkt->dts = dts;
+	pkt->pts = pts;
 
 	return ret;
 }
