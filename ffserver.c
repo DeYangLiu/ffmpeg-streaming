@@ -788,7 +788,7 @@ static int http_server(void)
 
         /* wait for events on each HTTP handle */
         c = first_http_ctx;
-        delay = 800;
+        delay = 2000;
         while (c != NULL) {
             int fd;
             fd = c->fd;
