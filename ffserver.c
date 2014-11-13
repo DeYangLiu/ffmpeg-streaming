@@ -33,31 +33,9 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/inotify.h>
+#include <netinet/tcp.h>
 
-#if 1
-#include <sys/types.h>
-#include<sys/msg.h>
-#define FF_MSG_CTRL 1234
-typedef struct{
-	long type; /*=1*/
-
-	long cmd;
-	long para[4];
-	char info[32];
-}msg_ctl_t;
-static int ctl_id = -1;
-static int ff_ctl_send(long cmd, char *info)
-{
-	int ret = -1;
-	msg_ctl_t m = {.type = 1, };
-	m.cmd = cmd;
-	sscanf(info, "%ld", &m.para[0]);
-	sprintf(m.info, "%s", info);
-
-	ret = msgsnd(ctl_id, &m, sizeof(msg_ctl_t)-sizeof(long), IPC_NOWAIT);
-	return ret;
-}
-#endif
+#define PLUGIN_DVB
 
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
@@ -74,7 +52,7 @@ typedef struct{
 }HLS;
 
 
-#define N 32
+#define N (128)
 typedef struct{
 	int type;
 	int size;
@@ -107,7 +85,7 @@ typedef struct HTTPContext {
     char url[64];
 	int post;
 	int http_error;
-	int keep_alive;
+	int keep_alive; /*whether response has Content-Length.*/
 	int64_t data_count;
     int last_packet_sent; /* true if last data packet was sent */
 	
@@ -157,26 +135,12 @@ static int64_t cur_time;
 
 static FILE *logfile = NULL;
 static void http_log(const char *fmt, ...);
+static int hls_close(void);
+static int sff_close(void);
 
-#if 1
-
-static int is_static_file(char *name)
-{/*static file is defined as whose content-length can be directly set by ffserver.*/
-	static char* a[] = {
-		"ProgList.htm",
-	};
-	int i;
-
-	if(av_match_ext(name, "m3u8") || av_match_ext(name, "ts")){
-		return 0;
-	}
-	
-	for(i = 0; i < sizeof(a)/sizeof(a[0]); ++i){
-		if(!av_strcasecmp(name, a[i]))return 0;
-	}
-
-	return 1;
-}
+#if defined(PLUGIN_DVB)
+#include "plugin_dvb.c"
+#endif
 
 static char* get_mine_type(char *name)
 {
@@ -196,7 +160,6 @@ static char* get_mine_type(char *name)
 
 	return mm[i][1];
 }
-
 
 static int prepare_local_file(HTTPContext *c)
 {/*return 1 if local file exist and can be read to buffer.*/
@@ -234,15 +197,13 @@ static int prepare_local_file(HTTPContext *c)
 
 	len += read(fd, c->pb_buffer + len, st.st_size);
 	close(fd);
+	http_log("local file %s size %lld\n", c->url, st.st_size);
 
     c->buffer_ptr = c->pb_buffer;
     c->buffer_end = c->pb_buffer + len;
 	return 1;
 }
 
-#endif 
-
-#if 1 //ludi add
 
 static HLS s_hls[S+1]; 
 static char s_hls_name[32];
@@ -392,6 +353,20 @@ static int hls_reset(HTTPContext *c)
 	return 0;
 }
 
+static int sff_close(void)
+{
+	HTTPContext *c = NULL, *c_next = NULL;
+	
+	for(c = first_http_ctx; c != NULL; c = c_next){
+		c_next = c->next;
+		if(c->post && av_match_ext(c->url, "flv")){
+			printf("sff close %s\n", c->url);
+			close_connection(c);
+		}
+	}
+	return 0;
+}
+
 static void sff_free(SFF **s)
 {
 	SFF *sff = NULL;
@@ -437,7 +412,7 @@ static void sff_dump(SFF *sff)
 	static FILE *fp = NULL;
 	static int cnt = 0;
 	if(!fp){
-		fp = fopen("dump.flv", "wb");
+		fp = fopen("/var/dump.flv", "wb");
 	}
 	
 	if(!fp){
@@ -449,8 +424,8 @@ static void sff_dump(SFF *sff)
 		cnt += sff->size;
 	}
 	if(2 == sff->type){
-		fwrite(sff->data + 28, sff->size - 28, 1, fp);
-		cnt += sff->size - 28;
+		fwrite(sff->data + 4, sff->size - 4, 1, fp);
+		cnt += sff->size - 4;
 	}
 	#endif
 	seq++;
@@ -610,8 +585,9 @@ static int http_receive_data(HTTPContext *c)
 
 check:
 	ret = ff_neterrno();
+	
 	if(len <= 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR)){
-		//http_log("conn end len %d ret %s\n", len, av_err2str(ret));
+		http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
 		if(s){
 			s->flag = 2;
 			//printf("hls get seg %d:%d:%d data %02x %02x %02x %02x\n", c->hls_idx, s->msize, s->csize, s->data[0], s->data[1], s->data[2], s->data[3]);
@@ -637,8 +613,6 @@ check:
 	if(trans)wake_others(c, trans);
 	return 0;
 }
-
-#endif
 
 static void htmlstrip(char *s) {
     while (s && *s) {
@@ -675,9 +649,7 @@ static void http_vlog(const char *fmt, va_list vargs)
     }
 }
 
-#ifdef __GNUC__
 __attribute__ ((format (printf, 1, 2)))
-#endif
 static void http_log(const char *fmt, ...)
 {
     va_list vargs;
@@ -879,8 +851,10 @@ static void new_connection(int server_fd, int is_rtsp)
     socklen_t len;
     int fd;
     HTTPContext *c = NULL;
+	int val;
 
     len = sizeof(from_addr);
+	memset(&from_addr, 0, len);
     fd = accept(server_fd, (struct sockaddr *)&from_addr,
                 &len);
     if (fd < 0) {
@@ -889,6 +863,17 @@ static void new_connection(int server_fd, int is_rtsp)
     }
     if (ff_socket_nonblock(fd, 1) < 0)
         av_log(NULL, AV_LOG_WARNING, "ff_socket_nonblock failed\n");
+	
+	#if	1 /*prevent myself close_wait*/
+	val = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
+	val = 5;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val));
+	val = 3;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val));
+	val = 2;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val));
+	#endif
 
     if (nb_connections >= nb_max_connections) {
         http_send_too_busy_reply(fd);
@@ -1013,6 +998,7 @@ static int handle_connection(HTTPContext *c)
             if (c->buffer_ptr >= c->buffer_end) {
                 av_freep(&c->pb_buffer);
 				if(c->keep_alive){
+					memset(c->buffer, 0, c->buffer_size);
 					c->buffer_ptr = c->buffer;
 				    c->buffer_end = c->buffer + c->buffer_size - 1; 
 					c->timeout = cur_time + HTTP_REQUEST_TIMEOUT;
@@ -1182,7 +1168,7 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	else if(!strcmp(tmp, "Connection:")){
 		get_word(info, sizeof(info), &p);
 		if(!av_strcasecmp(info, "keep-alive")){
-			c->keep_alive = is_static_file(c->url);
+			c->keep_alive = 1;
 		}
 	}
 	return 0;
@@ -1205,11 +1191,12 @@ static int http_parse_request(HTTPContext *c)
 	}
 	is_first = !av_stristr(rd.cookie, first_tag);
 
-    //http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
+    http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
 
 	/*handle m3u8/ts request solely*/
 	if(av_match_ext(c->url, "m3u8") 
 			|| av_match_ext(c->url, "ts")){
+		c->keep_alive = 0; 
 		ret = hls_parse_request(c, c->url, is_first);
 		if(ret < 0)goto send_error;
 		else if(ret == 1){
@@ -1219,13 +1206,24 @@ static int http_parse_request(HTTPContext *c)
 				http_log("%s\n", msg);
 				goto send_error;
 			}
+			#if defined(PLUGIN_DVB)
 			ff_ctl_send(1, c->url);
+			#endif
 			http_log("wait get %s\n", c->url);
 		}
 		if(c->state == HTTPSTATE_SEND_HEADER)
 			goto send_header;
 		return 0; /*end here*/
 	}
+
+	#if defined(PLUGIN_DVB)
+	ret = plugin_dvb(c, &rd);
+	if(ret < 0){
+		goto send_error;
+	}else if(ret > 0){
+		return 0;
+	}
+	#endif
 
     /*handle feed request*/
     if (c->post) {
@@ -1247,9 +1245,12 @@ static int http_parse_request(HTTPContext *c)
 		
 		ctx = find_feed(c->url);
 		if(!ctx){
+			c->keep_alive = 0; 
 			sprintf(msg, "wait to get %s", c->url);
 			http_log("%s\n", msg);
+			#if defined(PLUGIN_DVB)
 			ff_ctl_send(2, c->url); 
+			#endif
 		}else{
 			ctx->sff_ref_cnt++;
 		}
@@ -1290,6 +1291,7 @@ send_header:
 	}
     return 0;
  send_error:
+	c->keep_alive = 0;
     c->http_error = 404;
     q = c->buffer;
     htmlstrip(msg);
@@ -1319,7 +1321,7 @@ static int sff_prepare_data(HTTPContext *c)
     case HTTPSTATE_SEND_DATA_HEADER:
 		sff = sff_read(c, 1);
 		if(!sff){
-			printf("prepare no sff\n");
+			printf("prepare no sff for %s\n", c->url);
 			c->state = HTTPSTATE_WAIT_FEED;
 			return 1;
 		}
