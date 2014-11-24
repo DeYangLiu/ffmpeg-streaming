@@ -29,8 +29,8 @@ typedef struct{
 
 int ff_ts_init(TimestampContext *ist);
 int ff_ts_wrap(AVFormatContext *ctx, AVStream *st, TimestampContext *ts, AVPacket *pkt);
-
 int sff_write_block(AVIOContext *pb, int type, uint8_t *data, uint32_t size);
+int ff_filter_data(AVFormatContext *fmt_ctx, AVPacket *pkt);
 int ff_wrapper_write_header(AVFormatContext *ofmt_ctx);
 int ff_wrapper_write_packet(AVFormatContext *ofmt_ctx, AVPacket *pkt);
 int ff_wrapper_write_trailer(AVFormatContext *ofmt_ctx);
@@ -38,6 +38,8 @@ int ff_wrapper_write_trailer(AVFormatContext *ofmt_ctx);
 int ff_filter_init(int type);
 int ff_filter_close(int type);
 int ff_filter_data(AVFormatContext *fmt_ctx, AVPacket *pkt);
+
+int ff_thumbnail_generate(AVCodecContext *rctx, AVPacket *pkt, const char *filename, int width, int height);
 
 #endif
 
