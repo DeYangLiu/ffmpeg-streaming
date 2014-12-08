@@ -1,7 +1,4 @@
 /*
-   export PKG_CONFIG_PATH=$HOME/porting/host/lib/pkgconfig
-   gcc ffplay2.c cmdutils.o -g $(~/porting/host/bin/sdl2-config --cflags --libs) $(pkg-config --cflags libavcodec --libs libavcodec libavformat libavutil libavfilter libavdevice)
-
  * Copyright (c) 2003 Fabrice Bellard
  *
  * This file is part of FFmpeg.
