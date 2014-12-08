@@ -801,7 +801,7 @@ static inline void fill_rectangle(SDL_Surface *screen,
     rect.y = y;
     rect.w = w;
     rect.h = h;
-	SDL_SetRenderDrawColor(render, a, r, g, b);
+	SDL_SetRenderDrawColor(render, r, g, b, a);
 	SDL_RenderFillRect(render, &rect);
 }
 
@@ -945,7 +945,7 @@ static void video_image_display(VideoState *is)
             fill_border(is->xleft, is->ytop, is->width, is->height, rect.x, rect.y, rect.w, rect.h, bgcolor, 1);
             is->last_display_rect = rect;
         }
-			
+		SDL_SetRenderDrawColor(render, 0, 0, 0, 255);	
 		SDL_RenderClear(render);
 		SDL_RenderCopy(render, vp->bmp, &rect, &rect);
 		SDL_RenderPresent(render);
