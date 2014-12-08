@@ -40,7 +40,7 @@
 #include <stdint.h>
 
 #include "libavutil/avstring.h"
-//#include "libavutil/colorspace.h"
+#include "libavutil/colorspace.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/imgutils.h"
@@ -68,7 +68,6 @@
 
 
 #include "cmdutils.h"
-#include "colorspace.h"
 #define ARGB(a, r, g, b) (((a)<<24)|((r)<<16)|((g)<<8)|(b))
 
 
