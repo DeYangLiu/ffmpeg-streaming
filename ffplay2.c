@@ -792,11 +792,11 @@ static inline void fill_rectangle(SDL_Surface *screen,
                                   int x, int y, int w, int h, int color, int update)
 {
 	Uint8 a, r, g, b;
+    SDL_Rect rect;
 	a = (color&0xff000000)>>24;
 	r = (color&0x00ff0000)>>16;
 	g = (color&0x0000ff00)>>8;
 	b = (color&0x000000ff)>>0;
-    SDL_Rect rect;
     rect.x = x;
     rect.y = y;
     rect.w = w;
@@ -804,43 +804,6 @@ static inline void fill_rectangle(SDL_Surface *screen,
 	SDL_SetRenderDrawColor(render, r, g, b, a);
 	SDL_RenderFillRect(render, &rect);
 }
-
-/* draw only the border of a rectangle */
-static void fill_border(int xleft, int ytop, int width, int height, int x, int y, int w, int h, int color, int update)
-{
-    int w1, w2, h1, h2;
-
-    /* fill the background */
-    w1 = x;
-    if (w1 < 0)
-        w1 = 0;
-    w2 = width - (x + w);
-    if (w2 < 0)
-        w2 = 0;
-    h1 = y;
-    if (h1 < 0)
-        h1 = 0;
-    h2 = height - (y + h);
-    if (h2 < 0)
-        h2 = 0;
-    fill_rectangle(screen,
-                   xleft, ytop,
-                   w1, height,
-                   color, update);
-    fill_rectangle(screen,
-                   xleft + width - w2, ytop,
-                   w2, height,
-                   color, update);
-    fill_rectangle(screen,
-                   xleft + w1, ytop,
-                   width - w1 - w2, h1,
-                   color, update);
-    fill_rectangle(screen,
-                   xleft + w1, ytop + height - h2,
-                   width - w1 - w2, h2,
-                   color, update);
-}
-
 
 #define RGBA_IN(r, g, b, a, s)\
 {\
@@ -857,9 +820,6 @@ static void fill_border(int xleft, int ytop, int width, int height, int x, int y
 }
 
 #define BPP 1
-
-
-
 
 static void free_picture(Frame *vp)
 {
@@ -904,8 +864,6 @@ static void video_image_display(VideoState *is)
 {
     Frame *vp;
     Frame *sp;
-    AVPicture pict;
-    SDL_Rect rect;
     int i;
 
     vp = frame_queue_peek(&is->pictq);
@@ -938,16 +896,10 @@ static void video_image_display(VideoState *is)
                 }
             }
         }
-
-        calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
-        if (rect.x != is->last_display_rect.x || rect.y != is->last_display_rect.y || rect.w != is->last_display_rect.w || rect.h != is->last_display_rect.h || is->force_refresh) {
-            int bgcolor = ARGB(0xff, 0x00, 0x00, 0x00);
-            fill_border(is->xleft, is->ytop, is->width, is->height, rect.x, rect.y, rect.w, rect.h, bgcolor, 1);
-            is->last_display_rect = rect;
-        }
-		SDL_SetRenderDrawColor(render, 0, 0, 0, 255);	
+		
+		//SDL_SetRenderDrawColor(render, 0, 0, 0, 255);	
 		SDL_RenderClear(render);
-		SDL_RenderCopy(render, vp->bmp, &rect, &rect);
+		SDL_RenderCopy(render, vp->bmp, NULL, NULL);
 		SDL_RenderPresent(render);
     }
 }
@@ -963,7 +915,6 @@ static void video_audio_display(VideoState *s)
     int ch, channels, h, h2, bgcolor, fgcolor;
     int64_t time_diff;
     int rdft_bits, nb_freq;
-	SDL_Rect rect;
 
     for (rdft_bits = 1; (1 << rdft_bits) < 2 * s->height; rdft_bits++)
         ;
@@ -1151,10 +1102,10 @@ static void set_default_window_size(int width, int height, AVRational sar)
 
 static int video_open(VideoState *is, int force_set_video_mode, Frame *vp)
 {
-    int flags = SDL_WINDOW_SHOWN;
+    int flags = 0;
     int w,h;
 
-    if (is_full_screen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (is_full_screen) flags |= SDL_WINDOW_FULLSCREEN;
     else                flags |= SDL_WINDOW_RESIZABLE;
 
     if (vp && vp->width)
@@ -1177,7 +1128,7 @@ static int video_open(VideoState *is, int force_set_video_mode, Frame *vp)
 	if (!window_title)
         window_title = input_filename;	
 	if(!win){
-		win = SDL_CreateWindow(window_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, 0); //flags);
+		win = SDL_CreateWindow(window_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, flags);
 		if (!win) {
 			av_log(NULL, AV_LOG_FATAL, "SDL: could not set video mode - exiting\n");
 			do_exit(is);
@@ -1550,7 +1501,6 @@ display:
 static int do_scale_picture(VideoState *is, Frame *vp, AVFrame *src_frame)
 {
 	AVFrame *pict = NULL; 
-	SDL_Rect rc = {0};
 
 #if CONFIG_AVFILTER
 	pict = src_frame;
@@ -1572,10 +1522,6 @@ static int do_scale_picture(VideoState *is, Frame *vp, AVFrame *src_frame)
 	sws_scale(is->img_convert_ctx, src_frame->data, src_frame->linesize,
 			0, vp->height, pict->data, pict->linesize);
 #endif
-	rc.x = 0;
-	rc.y = 0;
-	rc.w = vp->width;
-	rc.h = vp->height;
 	SDL_UpdateYUVTexture(vp->bmp, NULL,
 			pict->data[0], pict->linesize[0],
 			pict->data[1], pict->linesize[1],
@@ -1618,18 +1564,6 @@ static void alloc_picture(VideoState *is, AVFrame *src)
     SDL_CondSignal(is->pictq.cond);
     SDL_UnlockMutex(is->pictq.mutex);
 }
-
-static void scale_picture(VideoState *is, AVFrame *frame)
-{
-    Frame *vp;
-    vp = &is->pictq.queue[is->pictq.windex];
-
-    SDL_LockMutex(is->pictq.mutex);
-    vp->allocated = 1;
-    SDL_CondSignal(is->pictq.cond);
-    SDL_UnlockMutex(is->pictq.mutex);
-}
-
 
 static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double duration, int64_t pos, int serial)
 {
@@ -2505,7 +2439,7 @@ static int stream_component_open(VideoState *is, int stream_index)
     if (!av_dict_get(opts, "threads", NULL, 0))
         av_dict_set(&opts, "threads", "auto", 0);
     if (stream_lowres)
-        ;//av_dict_set_int(&opts, "lowres", stream_lowres, 0);
+        av_dict_set_int(&opts, "lowres", stream_lowres, 0);
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO || avctx->codec_type == AVMEDIA_TYPE_AUDIO)
         av_dict_set(&opts, "refcounted_frames", "1", 0);
     if ((ret = avcodec_open2(avctx, codec, &opts)) < 0) {
@@ -2940,7 +2874,7 @@ static int read_thread(void *arg)
         }
         ret = av_read_frame(ic, pkt);
         if (ret < 0) {
-            if ((ret == AVERROR_EOF || url_feof(ic->pb)) && !eof) {
+            if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !eof) {
                 if (is->video_stream >= 0)
                     packet_queue_put_nullpacket(&is->videoq, is->video_stream);
                 if (is->audio_stream >= 0)
@@ -3317,7 +3251,7 @@ static void event_loop(VideoState *cur_stream)
 				case SDL_WINDOWEVENT_RESIZED:{
 					int w, h;
 					SDL_SetWindowSize(win, FFMIN(16383, (int)event.window.data1), (int)event.window.data2);
-					SDL_SetWindowFullscreen(win, (is_full_screen?SDL_WINDOW_FULLSCREEN_DESKTOP:0)); 
+					SDL_SetWindowFullscreen(win, (is_full_screen?SDL_WINDOW_FULLSCREEN:0)); 
 					SDL_GetWindowSize(win, &w, &h);
 					screen_width  = cur_stream->width  = w;
 					screen_height = cur_stream->height = h;
@@ -3637,7 +3571,7 @@ int main(int argc, char **argv)
     if (audio_disable)
         flags &= ~SDL_INIT_AUDIO;
     if (display_disable)
-        ;//SDL_putenv(dummy_videodriver); /* For the event queue, we always need a video driver. */
+        putenv(dummy_videodriver); /* For the event queue, we always need a video driver. */
     if (SDL_Init (flags)) {
         av_log(NULL, AV_LOG_FATAL, "Could not initialize SDL - %s\n", SDL_GetError());
         av_log(NULL, AV_LOG_FATAL, "(Did you set the DISPLAY variable?)\n");
