@@ -32,10 +32,10 @@ How to test
 ====
 Server
 ./ffserver &
-./remuxing -i input.mp4 -codec copy http://localhost:8090/out.m3u8
+./remuxing -i input.mp4 -codec copy http://localhost:80/out.m3u8
 
 PC client
-ffplay.exe http://server_ip:8090/out.m3u8
+ffplay.exe http://server_ip:80/out.m3u8
 
 test case
 ====

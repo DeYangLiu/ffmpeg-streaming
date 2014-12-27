@@ -2,6 +2,7 @@
  multiple format streaming server based on the FFmpeg libraries
  */
 
+#define _BSD_SOURCE  /*for struct ip_mreq, must be precede all header files.*/
 #include "config.h"
 #if !HAVE_CLOSESOCKET
 #define closesocket close
@@ -32,10 +33,10 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <signal.h>
-#include <sys/inotify.h>
 #include <netinet/tcp.h>
 
 #define PLUGIN_DVB
+#define PLUGIN_SSDP
 
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
@@ -86,6 +87,7 @@ typedef struct HTTPContext {
 	int post;
 	int http_error;
 	int keep_alive; /*whether response has Content-Length.*/
+	int content_length;
 	int64_t data_count;
     int last_packet_sent; /* true if last data packet was sent */
 	
@@ -111,6 +113,7 @@ typedef struct HTTPContext {
 typedef struct{/*extra data not in HTTPContext*/
 	char domain[64];
 	char cookie[512];
+	uint8_t content[512];
 }RequestData;
 
 static struct sockaddr_in my_http_addr;
@@ -142,13 +145,20 @@ static int sff_close(void);
 #include "plugin_dvb.c"
 #endif
 
-static char* get_mine_type(char *name)
+#if defined(PLUGIN_SSDP)
+#include "plugin_ssdp.c"
+#endif
+
+static const char* get_mine_type(char *name)
 {
 	int i, n;
 	
-	static char* mm[][2] = {
+	static const char* mm[][2] = {
 		".htm", "text/html",
 		".m3u8", "text/plain",
+		".ts", "video/MP2T",
+		".flv", "video/MP2T",
+		".xml", "text/xml",
 		"", "application/octet-stream",
 	};
 
@@ -186,8 +196,8 @@ static int prepare_local_file(HTTPContext *c)
 		return 0;
 	}
 	
-	len = sprintf(c->pb_buffer, "HTTP/1.0 200 OK\r\n"
-			"Content-type: %s\r\n"
+	len = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
+			"Content-type: %s;charset=UTF-8\r\n"
 			"Content-Length: %u\r\n"
 			"Connection: %s\r\n"
 			"\r\n", 
@@ -258,7 +268,7 @@ static int hls_parse_request(HTTPContext *c, char *name, int is_first)
 	if(c->post){/*writer*/
 		//todo: close http conn with same name
 		
-		http_log("hls post c %p name %s:%d data %p size %d:%d\n", c, name, idx, s->data, s->msize, s->csize);
+		//http_log("hls post c %p name %s:%d data %p size %d:%d\n", c, name, idx, s->data, s->msize, s->csize);
 
 		if(!s->data){
 			s->data = av_malloc(SEG_INC_SIZE);
@@ -467,7 +477,7 @@ static SFF* sff_read(HTTPContext *c, int type)
 		return f->sff_pkts[N];
 	}
 
-	if(c->sff_r == f->sff_w){
+	if(av_match_ext(c->url, "flv") && FFABS(c->sff_r - f->sff_w) <= 0){
 		return NULL;
 	}
 	
@@ -568,7 +578,7 @@ static int http_receive_data(HTTPContext *c)
 		
 		recv(c->fd, ptr, 4, 0);
 		size = AV_RB32(ptr); 
-		if(size > 1E6)continue;
+		if(!size || size > 1E6)continue;
 		
 		c->sff = sff = av_mallocz(sizeof(* c->sff));
 		sff->type = type;
@@ -587,7 +597,7 @@ check:
 	ret = ff_neterrno();
 	
 	if(len <= 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR)){
-		http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
+		//http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
 		if(s){
 			s->flag = 2;
 			//printf("hls get seg %d:%d:%d data %02x %02x %02x %02x\n", c->hls_idx, s->msize, s->csize, s->data[0], s->data[1], s->data[2], s->data[3]);
@@ -670,6 +680,14 @@ static void http_av_log(void *ptr, int level, const char *fmt, va_list vargs)
     http_vlog(fmt, vargs);
 }
 
+static int get_socket_error(int fd)
+{
+	int error = 0;
+	socklen_t errlen = sizeof(error);
+	getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen);
+	return error;
+}
+
 static void log_connection(HTTPContext *c)
 {
 	//if(av_match_ext(c->url, "m3u8"))
@@ -720,7 +738,6 @@ static int http_server(void)
     int ret, delay;
     struct pollfd *poll_table, *poll_entry;
     HTTPContext *c, *c_next;
-
     if(!(poll_table = av_mallocz_array(nb_max_http_connections + 1, sizeof(*poll_table)))) {
         http_log("Impossible to allocate a poll table handling %d connections.\n", nb_max_http_connections);
         return -1;
@@ -735,10 +752,18 @@ static int http_server(void)
     }
 
     if ( !server_fd) {
-        http_log("HTTP and RTSP disabled.\n");
+        http_log("HTTP disabled.\n");
         av_free(poll_table);
         return -1;
     }
+	
+	#if defined(PLUGIN_SSDP)
+	ssdp_fd = mcast_open(ssdp_ip, ssdp_port);
+	if(ssdp_fd <= 0){
+		http_log("ssdp disabled\n");
+	}
+	ssdp_notify(ssdp_fd, ssdp_ip, ssdp_port, "ssdp:alive");
+	#endif
 
 	
 	ctl_id = msgget(FF_MSG_CTRL, IPC_CREAT|0666);
@@ -757,6 +782,14 @@ static int http_server(void)
             poll_entry->events = POLLIN;
             poll_entry++;
         }
+		
+		#if defined(PLUGIN_SSDP)
+		if(ssdp_fd){
+			poll_entry->fd = ssdp_fd;
+            poll_entry->events = POLLIN;
+            poll_entry++;
+		}
+		#endif
 
         /* wait for events on each HTTP handle */
         c = first_http_ctx;
@@ -823,6 +856,14 @@ static int http_server(void)
                 new_connection(server_fd, 0);
             poll_entry++;
         }
+		
+		#if defined(PLUGIN_SSDP)
+		if (ssdp_fd) {
+            if (poll_entry->revents & POLLIN)
+                ssdp_response(ssdp_fd);
+            poll_entry++;
+        }
+		#endif
 	
     }
 }
@@ -831,7 +872,7 @@ static void http_send_too_busy_reply(int fd)
 {
     char buffer[400];
     int len = snprintf(buffer, sizeof(buffer),
-                       "HTTP/1.0 503 Server too busy\r\n"
+                       "HTTP/1.1 503 Server too busy\r\n"
                        "Content-type: text/html\r\n"
                        "\r\n"
                        "<html><head><title>Too busy</title></head><body>\r\n"
@@ -864,7 +905,7 @@ static void new_connection(int server_fd, int is_rtsp)
     if (ff_socket_nonblock(fd, 1) < 0)
         av_log(NULL, AV_LOG_WARNING, "ff_socket_nonblock failed\n");
 	
-	#if	1 /*prevent myself close_wait*/
+	#if	0 /*prevent myself close_wait*/
 	val = 1;
 	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
 	val = 5;
@@ -1050,8 +1091,8 @@ static int handle_connection(HTTPContext *c)
         break;
     case HTTPSTATE_WAIT_FEED:
         /* no need to read if no events */
-        if (c->poll_entry->revents & (POLLIN | POLLERR | POLLHUP))
-            return -1;
+        if (c->poll_entry->revents & (POLLIN | POLLERR | POLLHUP)) /*19*/
+            {printf("line %d: %x:%d\n", __LINE__, c->poll_entry->revents, get_socket_error(c->fd)); return -1;} 
         /* nothing to do, we'll be waken up by incoming feed packets */
         break;
 
@@ -1112,17 +1153,26 @@ static int get_line(char *buf, int buf_size, const char **pp)
 	const char *p = *pp;
 	char *q = buf;
 
-	while(*p && (*p == '\r' || *p == '\n')){
+	while(*p && !(*p == '\r' || *p == '\n')){
+		if(q - buf < buf_size - 1)*q++ = *p++; 
+	}
+	if(!*p){
+		return 0;
+	}
+	/*drop "rn", "r", or "n"*/
+	if(*p == '\r'){
 		p++;
 	}
-	while(*p && !(*p == '\r' || *p == '\n')){
-		if(q - buf < buf_size - 1)*q++ = *p++;	
+	if(*p == '\n'){
+		p++;
 	}
+
+
 	*q = 0;
 	*pp = p;
 	return q - buf;
-}
 
+}
 static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *rd)
 {
 	char *p1, tmp[32], info[32];
@@ -1171,7 +1221,23 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 			c->keep_alive = 1;
 		}
 	}
+	else if(!av_strcasecmp(tmp, "Content-Length:")){
+		get_word(info, sizeof(info), &p);
+		c->content_length = atoi(info);
+	}
 	return 0;
+}
+
+static int read_request_content(HTTPContext *c, uint8_t *buf, int bufsize)
+{
+	int ret, rsize = FFMIN(bufsize-2, c->content_length);
+	ret =  recv(c->fd, buf, rsize, 0);
+	printf("read content size %d-->%d\n", rsize, ret);
+	if(ret <= 0){/*only try one time.*/
+		ret = 0;
+	}
+
+	return ret;
 }
 
 /* parse HTTP request and prepare header */
@@ -1190,8 +1256,34 @@ static int http_parse_request(HTTPContext *c)
 		if(ret < 0)return ret;
 	}
 	is_first = !av_stristr(rd.cookie, first_tag);
+	
+	if(c->post && c->content_length 
+		&& !av_match_ext(c->url, "m3u8")
+		&& !av_match_ext(c->url, "ts")
+		&& !av_match_ext(c->url, "flv")){
+		c->post = 0;
+		c->content_length = read_request_content(c, rd.content, sizeof(rd.content));
+	}
+	#if defined(PLUGIN_DVB)
+	if(!c->post && !strcmp(c->url, "digitalDvb/allServiceType/getClientInfo")){
+		uint32_t *ptr = (uint32_t*)rd.content, *ptr_end = (uint32_t*)(rd.content+sizeof(rd.content)-8);
+		for(ctx = first_http_ctx; ctx; ctx = ctx->next) 
+			if(!ctx->post && av_match_ext(ctx->url, "flv") )
+			{/*todo: record hls*/
+				if(ptr < ptr_end){
+					int chid = -1;
+					sscanf(ctx->url, "%d", &chid);
+		
+					*ptr++ = inet_addr(inet_ntoa(ctx->from_addr.sin_addr));
+					*ptr++ = chid;
 
-    http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
+					printf("ip %s id %u %s\t", inet_ntoa(ctx->from_addr.sin_addr), chid, ctx->url);
+				}
+			}
+	}
+	#endif
+
+    //http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
 
 	/*handle m3u8/ts request solely*/
 	if(av_match_ext(c->url, "m3u8") 
@@ -1207,7 +1299,7 @@ static int http_parse_request(HTTPContext *c)
 				goto send_error;
 			}
 			#if defined(PLUGIN_DVB)
-			ff_ctl_send(1, c->url);
+			ff_ctl_send(1, c->url, rd.content);
 			#endif
 			http_log("wait get %s\n", c->url);
 		}
@@ -1249,7 +1341,7 @@ static int http_parse_request(HTTPContext *c)
 			sprintf(msg, "wait to get %s", c->url);
 			http_log("%s\n", msg);
 			#if defined(PLUGIN_DVB)
-			ff_ctl_send(2, c->url); 
+			ff_ctl_send(2, c->url, rd.content); 
 			#endif
 		}else{
 			ctx->sff_ref_cnt++;
@@ -1260,10 +1352,11 @@ static int http_parse_request(HTTPContext *c)
 send_header:
     /* prepare HTTP header */
     c->buffer[0] = 0;
-    av_strlcatf(c->buffer, c->buffer_size, "HTTP/1.0 200 OK\r\n");
+    av_strlcatf(c->buffer, c->buffer_size, "HTTP/1.1 200 OK\r\n");
 	mime_type =  get_mine_type(c->url);
     av_strlcatf(c->buffer, c->buffer_size, "Pragma: no-cache\r\n");
     av_strlcatf(c->buffer, c->buffer_size, "Content-Type: %s\r\n", mime_type);
+	av_strlcatf(c->buffer, c->buffer_size, "Connection: %s\r\n", (c->keep_alive ? "keep-alive" : "close"));
 	av_strlcatf(c->buffer, c->buffer_size, "Set-Cookie: %s; Path=/; Domain=%s\r\n", first_tag, rd.domain);
     av_strlcatf(c->buffer, c->buffer_size, "\r\n");
 
@@ -1274,7 +1367,8 @@ send_header:
     c->buffer_ptr = c->buffer;
     c->buffer_end = q;
     c->state = HTTPSTATE_SEND_HEADER;
-	
+
+	#if 0
 	if(S == c->hls_idx){
 		HLS *s = &s_hls[c->hls_idx];
 		char *ext = strrchr(c->url, '.');
@@ -1289,6 +1383,7 @@ send_header:
 				"%.*s0.ts\n", ext - c->url, c->url);
 		}
 	}
+	#endif
     return 0;
  send_error:
 	c->keep_alive = 0;
@@ -1296,7 +1391,7 @@ send_header:
     q = c->buffer;
     htmlstrip(msg);
     snprintf(q, c->buffer_size,
-                  "HTTP/1.0 404 Not Found\r\n"
+                  "HTTP/1.1 404 Not Found\r\n"
                   "Content-type: text/html\r\n"
                   "\r\n"
                   "<html>\n"
@@ -1397,7 +1492,7 @@ static int http_send_data(HTTPContext *c)
 
 static int parse_config(void)
 {
-	my_http_addr.sin_port = htons(8090);
+	my_http_addr.sin_port = htons(80);
 	nb_max_http_connections = 1000;
 	nb_max_connections = 1000;
 	max_bandwidth = 80000;
