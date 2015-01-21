@@ -142,7 +142,14 @@ static int hls_close(void);
 static int sff_close(void);
 
 #if defined(PLUGIN_DVB)
+#include "stream_buffer.c"
 #include "plugin_dvb.c"
+
+static int ctl_msg_cb(ctrl_msg_t *msg)
+{
+	printf("ctl msg: %d '%s' '%s'\n", msg->cmd, msg->name, msg->data);
+	return 0;
+}
 #endif
 
 #if defined(PLUGIN_SSDP)
@@ -720,7 +727,7 @@ static int socket_open_listen(struct sockaddr_in *my_addr)
         return -1;
     }
 
-    if (listen (server_fd, 5) < 0) {
+    if (listen (server_fd, 50) < 0) {
         perror ("listen");
         closesocket(server_fd);
         return -1;
@@ -735,6 +742,7 @@ static int socket_open_listen(struct sockaddr_in *my_addr)
 static int http_server(void)
 {
     int server_fd = 0;
+	int ctrl_fd = 0, ctrl_fd2 = 0;
     int ret, delay;
     struct pollfd *poll_table, *poll_entry;
     HTTPContext *c, *c_next;
@@ -743,6 +751,14 @@ static int http_server(void)
         return -1;
     }
 
+	#if defined(PLUGIN_DVB)
+	ctrl_fd = ff_ctl_open(1234);
+    if (ctrl_fd < 0) {
+        av_free(poll_table);
+        return -1;
+    }
+	#endif
+	
     if (my_http_addr.sin_port) {
         server_fd = socket_open_listen(&my_http_addr);
         if (server_fd < 0) {
@@ -764,19 +780,28 @@ static int http_server(void)
 	}
 	ssdp_notify(ssdp_fd, ssdp_ip, ssdp_port, "ssdp:alive");
 	#endif
-
-	
-	ctl_id = msgget(FF_MSG_CTRL, IPC_CREAT|0666);
-	if(ctl_id < 0){
-		http_log("cant create msg que\n");
-		av_free(poll_table);
-        return -1;
-	}
 	
     http_log("FFserver started.\n");
 
     for(;;) {
         poll_entry = poll_table;
+		
+		#if defined(PLUGIN_DVB)
+		if(ctrl_fd){
+			poll_entry->fd = ctrl_fd;
+            poll_entry->events = POLLIN;
+            poll_entry++;
+		}
+		if(ctrl_fd2){
+			poll_entry->fd = ctrl_fd2;
+			poll_entry->events = POLLIN;
+			if(ctl_msg_pending() > 0){
+				poll_entry->events |= POLLOUT;
+			}
+            poll_entry++;
+		}
+		#endif
+		
         if (server_fd) {
             poll_entry->fd = server_fd;
             poll_entry->events = POLLIN;
@@ -793,7 +818,7 @@ static int http_server(void)
 
         /* wait for events on each HTTP handle */
         c = first_http_ctx;
-        delay = 2000;
+        delay = 1500;
         while (c != NULL) {
             int fd;
             fd = c->fd;
@@ -851,6 +876,28 @@ static int http_server(void)
         }
 
         poll_entry = poll_table;
+
+		#if defined(PLUGIN_DVB)
+		if(ctrl_fd){
+			if(poll_entry->revents & POLLIN){
+				ctrl_fd2 = ctl_msg_open(ctrl_fd);
+			}
+			poll_entry++;
+		}
+		if(ctrl_fd2 && poll_entry->fd == ctrl_fd2){
+			if(poll_entry->revents & POLLIN){
+				ctl_msg_recv();
+				ff_ctl_recv(ctl_msg_cb);
+			}else if(poll_entry->revents & POLLOUT){
+				ctl_msg_send();
+			}
+			poll_entry++;
+		}
+		#endif
+		if(poll_entry->fd != server_fd){
+			printf("bad  entry\n");
+		}
+		
         if (server_fd) {
             if (poll_entry->revents & POLLIN)
                 new_connection(server_fd, 0);
@@ -893,6 +940,7 @@ static void new_connection(int server_fd, int is_rtsp)
     int fd;
     HTTPContext *c = NULL;
 	int val;
+	val = 0;
 
     len = sizeof(from_addr);
 	memset(&from_addr, 0, len);
@@ -1299,7 +1347,7 @@ static int http_parse_request(HTTPContext *c)
 				goto send_error;
 			}
 			#if defined(PLUGIN_DVB)
-			ff_ctl_send(1, c->url, rd.content);
+			ff_ctl_send_string(1, c->url, rd.content);
 			#endif
 			http_log("wait get %s\n", c->url);
 		}
@@ -1341,7 +1389,7 @@ static int http_parse_request(HTTPContext *c)
 			sprintf(msg, "wait to get %s", c->url);
 			http_log("%s\n", msg);
 			#if defined(PLUGIN_DVB)
-			ff_ctl_send(2, c->url, rd.content); 
+			ff_ctl_send(2, c->url, strlen(c->url)+1, rd.content, sizeof(rd.content)); 
 			#endif
 		}else{
 			ctx->sff_ref_cnt++;

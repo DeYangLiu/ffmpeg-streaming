@@ -1,40 +1,4 @@
 
-#include <sys/types.h>
-#include<sys/msg.h>
-
-#define MAX_URL_NAME_LENGTH 128
-#define FF_MSG_CTRL 1234
-typedef struct{
-	long type; /*=1*/
-
-	long cmd;
-	char info[MAX_URL_NAME_LENGTH];
-	char content[512];
-}msg_ctl_t;
-static int ctl_id = -1;
-static int ff_ctl_send(long cmd, char *info, char *para)
-{
-	int ret = -1;
-	msg_ctl_t m = {.type = 1, };
-	m.cmd = cmd;
-	
-	sprintf(m.info, "%s", info);
-	if(para){
-		memcpy(m.content, para, sizeof(m.content));
-	}
-
-	ret = msgsnd(ctl_id, &m, sizeof(msg_ctl_t)-sizeof(long), IPC_NOWAIT);
-
-	if(av_match_ext(info, "flv")){
-		hls_close();
-	}else if(av_match_ext(info, "m3u8")){
-		sff_close();
-	}
-	
-	return ret;
-}
-
-
 static int ignore_request(HTTPContext *c)
 {
 	static const char *a[] = {

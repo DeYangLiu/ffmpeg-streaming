@@ -11,14 +11,6 @@
 #include "libavutil/intreadwrite.h"
 
 #define MAX_URL_NAME_LENGTH 128
-#define FF_MSG_CTRL 1234
-typedef struct{
-	long type; 
-
-	long cmd;
-	long para[4];
-	char info[MAX_URL_NAME_LENGTH];
-}msg_ctl_t;
 
 typedef struct{
 	int64_t dts, next_dts, pts, next_pts;
@@ -41,6 +33,7 @@ int ff_filter_data(AVFormatContext *fmt_ctx, AVPacket *pkt);
 
 int ff_thumbnail_generate(AVCodecContext *rctx, AVPacket *pkt, const char *filename, int width, int height);
 
+int ff_ctl_send_string(int cmd, char *name, char *data);
 #endif
 
 

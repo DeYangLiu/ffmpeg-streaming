@@ -23,7 +23,10 @@ static int is_pes_start_code(int32_t code)
 		return 1; /*video*/
 	}else if((code & 0xffffffe0) == (0x1c0 & 0xffffffe0) ){
 		return 2; /*audio*/
+	}else if(0x000001bd == code || 0x000001bf == code){
+		return 2; /*private_stream*/
 	}
+	
 	return 0;
 }
 
