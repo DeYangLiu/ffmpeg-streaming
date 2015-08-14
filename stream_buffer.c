@@ -272,6 +272,7 @@ int ff_ctl_open2(char *ip, unsigned short port)
 
     if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0){
        printf("cant connect to ip '%s'\n", ip);
+	   close(fd);
        return -1;
     } 
 

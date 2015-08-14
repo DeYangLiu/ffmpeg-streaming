@@ -1,15 +1,30 @@
 /*
  multiple format streaming server based on the FFmpeg libraries
+ mingw: gcc -DFFMPEG_SRC=0 -O3 -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c -lws2_32
+ 
  */
+
+//#define PLUGIN_DVB
+//#define PLUGIN_SSDP
+#define FFMPEG_SRC 0
 
 #define _BSD_SOURCE  /*for struct ip_mreq, must be precede all header files.*/
 #include "config.h"
-#if !HAVE_CLOSESOCKET
-#define closesocket close
-#endif
+
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <inttypes.h> //PRId64
+
+#if FFMPEG_SRC == 0
+#include "compact.h"
+#else
+ #if HAVE_CLOSESOCKET  == 1
+  #define close_socket closesocket
+ #else
+  #define close_socket close
+ #endif
+
 #include "libavformat/avformat.h"
 #include "libavformat/network.h"
 #include "libavformat/os_support.h"
@@ -19,24 +34,24 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/time.h"
+#endif
 
 #include <stdarg.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 #include <fcntl.h>
-#include <sys/ioctl.h>
+//#include <sys/ioctl.h>
+#include <sys/stat.h>
 #if HAVE_POLL_H
 #include <poll.h>
 #endif
 #include <errno.h>
 #include <time.h>
-#include <sys/wait.h>
+//#include <sys/wait.h>
 #include <signal.h>
-#include <netinet/tcp.h>
+//#include <netinet/tcp.h>
 
-#define PLUGIN_DVB
-#define PLUGIN_SSDP
 
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
@@ -61,6 +76,12 @@ typedef struct{
 	int wpos;
 	int wflag; /*1--is writing, cant be read*/
 }SFF;
+
+typedef struct{
+	uint8_t *data;
+	int size;
+	uint32_t stream_index;
+}packet_t;
 
 typedef enum {
     HTTPSTATE_WAIT_REQUEST = 1,
@@ -147,7 +168,13 @@ static int sff_close(void);
 
 static int ctl_msg_cb(ctrl_msg_t *msg)
 {
-	printf("ctl msg: %d '%s' '%s'\n", msg->cmd, msg->name, msg->data);
+	http_log("ctl msg: %d '%s' '%s'\n", msg->cmd, msg->name, msg->data);
+	if(5 == msg->cmd){
+		if(av_match_ext(msg->data, "m3u8")){
+			hls_close();
+		}
+		ff_ctl_send_string(5, msg->name, msg->data);
+	}
 	return 0;
 }
 #endif
@@ -166,6 +193,8 @@ static const char* get_mine_type(char *name)
 		".ts", "video/MP2T",
 		".flv", "video/MP2T",
 		".xml", "text/xml",
+		".h", "text/plain",
+		".c", "text/plain",
 		"", "application/octet-stream",
 	};
 
@@ -493,7 +522,7 @@ static SFF* sff_read(HTTPContext *c, int type)
 	return sff;
 }
 
-static int sff_parse(SFF *sff, AVPacket *pkt)
+static int sff_parse(SFF *sff, packet_t *pkt)
 {
 	uint8_t *ptr = NULL;
 	if(!pkt || !sff || 2 != sff->type){
@@ -603,7 +632,7 @@ static int http_receive_data(HTTPContext *c)
 check:
 	ret = ff_neterrno();
 	
-	if(len <= 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR)){
+	if((len == 0) || (len < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR))){
 		//http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
 		if(s){
 			s->flag = 2;
@@ -678,12 +707,14 @@ static void http_log(const char *fmt, ...)
 static void http_av_log(void *ptr, int level, const char *fmt, va_list vargs)
 {
     static int print_prefix = 1;
+	#if FFMPEG_SRC
     AVClass *avc = ptr ? *(AVClass**)ptr : NULL;
     if (level > av_log_get_level())
         return;
     if (print_prefix && avc)
         http_log("[%s @ %p]", avc->item_name(ptr), ptr);
     print_prefix = strstr(fmt, "\n") != NULL;
+	#endif
     http_vlog(fmt, vargs);
 }
 
@@ -698,8 +729,9 @@ static int get_socket_error(int fd)
 static void log_connection(HTTPContext *c)
 {
 	//if(av_match_ext(c->url, "m3u8"))
-    	http_log("%s:%u %d \"%s\" %lld %d %d\n",
-             inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), 
+    	http_log("%s:%u %d '%s' %" PRId64 " %d %d\n",
+             inet_ntoa(c->from_addr.sin_addr), 
+			 ntohs(c->from_addr.sin_port), 
 			 c->post, c->url,
 			 c->data_count, c->http_error, nb_connections);
 }
@@ -716,25 +748,25 @@ static int socket_open_listen(struct sockaddr_in *my_addr)
 
     tmp = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp)))
-        av_log(NULL, AV_LOG_WARNING, "setsockopt SO_REUSEADDR failed\n");
+        http_log("setsockopt SO_REUSEADDR failed\n");
 
     my_addr->sin_family = AF_INET;
     if (bind (server_fd, (struct sockaddr *) my_addr, sizeof (*my_addr)) < 0) {
         char bindmsg[32];
         snprintf(bindmsg, sizeof(bindmsg), "bind(port %d)", ntohs(my_addr->sin_port));
         perror (bindmsg);
-        closesocket(server_fd);
+        close_socket(server_fd);
         return -1;
     }
 
     if (listen (server_fd, 50) < 0) {
         perror ("listen");
-        closesocket(server_fd);
+        close_socket(server_fd);
         return -1;
     }
 
     if (ff_socket_nonblock(server_fd, 1) < 0)
-        av_log(NULL, AV_LOG_WARNING, "ff_socket_nonblock failed\n");
+        http_log("ff socket set nonblock failed\n");
 
     return server_fd;
 }
@@ -896,6 +928,7 @@ static int http_server(void)
 		#endif
 		if(poll_entry->fd != server_fd){
 			printf("bad  entry\n");
+			continue;
 		}
 		
         if (server_fd) {
@@ -929,7 +962,7 @@ static void http_send_too_busy_reply(int fd)
                        nb_connections, nb_max_connections);
     av_assert0(len < sizeof(buffer));
     if (send(fd, buffer, len, 0) < len)
-        av_log(NULL, AV_LOG_WARNING, "Could not send too-busy reply, send() failed\n");
+        http_log("Could not send too-busy reply, send() failed\n");
 }
 
 
@@ -951,7 +984,7 @@ static void new_connection(int server_fd, int is_rtsp)
         return;
     }
     if (ff_socket_nonblock(fd, 1) < 0)
-        av_log(NULL, AV_LOG_WARNING, "ff_socket_nonblock failed\n");
+        http_log("ff socket set nonblock failed\n");
 	
 	#if	0 /*prevent myself close_wait*/
 	val = 1;
@@ -997,7 +1030,7 @@ static void new_connection(int server_fd, int is_rtsp)
         av_free(c->buffer);
         av_free(c);
     }
-    closesocket(fd);
+    close_socket(fd);
 }
 
 static void close_connection(HTTPContext *c)
@@ -1016,7 +1049,7 @@ static void close_connection(HTTPContext *c)
 
     /* remove connection associated resources */
     if (c->fd >= 0)
-        closesocket(c->fd);
+        close_socket(c->fd);
 
     av_freep(&c->pb_buffer);
     av_free(c->buffer);
@@ -1458,7 +1491,7 @@ send_header:
 static int sff_prepare_data(HTTPContext *c)
 {
 	SFF *sff = NULL;  
-	AVPacket pkt = {0};
+	packet_t pkt = {0};
 
     switch(c->state) {
     case HTTPSTATE_SEND_DATA_HEADER:
@@ -1545,7 +1578,9 @@ static int parse_config(void)
 	nb_max_connections = 1000;
 	max_bandwidth = 80000;
     logfile = stdout;
+	#if FFMPEG_SRC
     av_log_set_callback(http_av_log);
+	#endif
 	return 0;
 }
 
@@ -1561,10 +1596,16 @@ int main(int argc, char **argv)
 {
     //av_register_all();
     //avformat_network_init();
-    unsetenv("http_proxy");  /* Kill the http_proxy */
+    putenv("http_proxy=");  /* Kill the http_proxy */
 
 	parse_config();
+	#if HAVE_WINSOCK2_H
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(1,1), &wsa);
+	_fmode = _O_BINARY;  //extern extern int _fmode in crt0.o
+	#else
     signal(SIGPIPE, SIG_IGN);
+	#endif
 
     if (http_server() < 0) {
         http_log("Could not start server\n");
