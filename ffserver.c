@@ -1,12 +1,13 @@
 /*
  multiple format streaming server based on the FFmpeg libraries
- mingw: gcc -DFFMPEG_SRC=0 -O3 -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c -lws2_32
+ mingw: gcc -DFFMPEG_SRC=0 -O0 -g  -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c -lws2_32
  
  */
 
 //#define PLUGIN_DVB
 //#define PLUGIN_SSDP
 #define FFMPEG_SRC 0
+#define FILE_BUF_SIZE (2*1024*1024)
 
 #define _BSD_SOURCE  /*for struct ip_mreq, must be precede all header files.*/
 #include "config.h"
@@ -129,12 +130,16 @@ typedef struct HTTPContext {
 	/*reader specific*/
 	struct HTTPContext *feed_ctx; /*data source*/
 	int sff_r;
+
+	int local_fd; /*local file handle*/
+	int64_t total_count; /*http header + file size*/
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
 	char domain[64];
 	char cookie[512];
 	uint8_t content[512];
+	char range[32];
 }RequestData;
 
 static struct sockaddr_in my_http_addr;
@@ -195,6 +200,7 @@ static const char* get_mine_type(char *name)
 		".xml", "text/xml",
 		".h", "text/plain",
 		".c", "text/plain",
+		".txt", "text/plain",
 		"", "application/octet-stream",
 	};
 
@@ -207,13 +213,17 @@ static const char* get_mine_type(char *name)
 	return mm[i][1];
 }
 
-static int prepare_local_file(HTTPContext *c)
+static int prepare_local_file(HTTPContext *c, RequestData *rd)
 {/*return 1 if local file exist and can be read to buffer.*/
-    int len;
+    int64_t len = 0, len0 = 0;
 	unsigned char tmp[64] = "";
 	char prefix[32] = ".";
 	int fd = -1;
 	struct stat st = {0};
+	int64_t off_start = 0, off_end = 0;
+	int64_t size = 0, wanted = 0, tried = 0;
+	int status = 200;
+	char *msg = "OK";
 
 	snprintf(tmp, sizeof(tmp)-1, "%s/%s",  prefix, c->url);
 	fd = open(tmp, O_RDONLY);
@@ -224,7 +234,24 @@ static int prepare_local_file(HTTPContext *c)
 		return 0;
 	}
 	
-	c->pb_buffer = av_malloc(1024 + st.st_size);
+	//Range:bytes=start-end
+	if(!strncmp(rd->range, "bytes=", 6)){
+		char *ptr = rd->range + 6;
+		off_start = strtoll(ptr, NULL, 10);
+		ptr = strchr(ptr, '-');
+		if(ptr && strlen(ptr) > 1){
+			off_end = strtoll(ptr+1, NULL, 10);
+		}
+		status = 206;
+		msg = "Partial Content";
+		if(off_end <= 0 || off_end >= st.st_size){
+			off_end = st.st_size - 1;
+		}
+	}
+	wanted = (206 == status ? off_end-off_start+1 : st.st_size);
+	size = FFMIN(wanted + 1024, FILE_BUF_SIZE);
+
+	c->pb_buffer = av_malloc(size);
 	if(!c->pb_buffer){
         c->buffer_ptr = c->buffer;
         c->buffer_end = c->buffer;
@@ -232,22 +259,73 @@ static int prepare_local_file(HTTPContext *c)
 		return 0;
 	}
 	
-	len = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
+	len0 = sprintf(c->pb_buffer, "HTTP/1.1 %d %s\r\n"
 			"Content-type: %s;charset=UTF-8\r\n"
-			"Content-Length: %u\r\n"
+			"Accept-Ranges: bytes\r\n"
+			"Content-Range: bytes %" PRId64 "-%" PRId64 "/%" PRId64 "\r\n"
+			"Content-Length: %" PRId64 "\r\n"
 			"Connection: %s\r\n"
 			"\r\n", 
+			status, msg, //200, "OK", 
 			get_mine_type(c->url),
-			(unsigned int)st.st_size, 
+			(int64_t)off_start, 
+			(int64_t)(206 == status ? off_end : st.st_size-1), 
+			(int64_t)st.st_size,
+			(int64_t)(206 == status ? off_end-off_start+1 : st.st_size), 
 			(c->keep_alive ? "keep-alive" : "close") );
 
-	len += read(fd, c->pb_buffer + len, st.st_size);
-	close(fd);
-	http_log("local file %s size %lld\n", c->url, st.st_size);
+	tried = FFMIN(size-len0, wanted);
+	lseek(fd, (off_t)off_start, SEEK_SET);
+	len = read(fd, c->pb_buffer + len0, tried);
+	if(len < 0){
+		http_log("local file read err %d\n", len);
+		return 0;
+	}
+
+	if(len == wanted){
+		close(fd);
+		c->http_error = 200;
+		c->local_fd = -1;
+	}else{
+		c->local_fd = fd;
+		c->http_error = 0;
+		c->total_count = len0 + wanted;
+	}
+	http_log("local file %s size %lld head %lld range '%s'\n", c->url, st.st_size, len0, rd->range);
 
     c->buffer_ptr = c->pb_buffer;
-    c->buffer_end = c->pb_buffer + len;
+    c->buffer_end = c->pb_buffer + len + len0;
 	return 1;
+}
+
+static int local_prepare_data(HTTPContext *c)
+{
+	int rlen = 0;
+
+	if(c->buffer_end > c->buffer + c->buffer_size){
+		http_log("internal err bad state: buffer_end exceeds buffer\n");
+		return -1;
+	}
+
+	if(c->keep_alive && c->data_count >= c->total_count){
+		memset(c->buffer, 0, c->buffer_size);
+		c->buffer_ptr = c->buffer;
+		c->buffer_end = c->buffer + c->buffer_size - 1; 
+		c->timeout = cur_time + HTTP_REQUEST_TIMEOUT;
+		c->state = HTTPSTATE_WAIT_REQUEST;
+		http_log("%u local-alive %s\n", ntohs(c->from_addr.sin_port), c->url);
+		return 1;
+	}
+
+	rlen = read(c->local_fd, c->buffer, c->buffer_size); 
+	if(rlen <= 0){
+		close(c->local_fd);
+		return -1;
+	}
+
+	c->buffer_ptr = c->buffer;
+	c->buffer_end = c->buffer_ptr + rlen;
+	return 0;
 }
 
 
@@ -1023,6 +1101,7 @@ static void new_connection(int server_fd, int is_rtsp)
 	c->timeout = cur_time + HTTP_REQUEST_TIMEOUT;
     c->state = HTTPSTATE_WAIT_REQUEST;
 	c->hls_idx = -1;
+	c->local_fd = -1;
 
     return;
  fail:
@@ -1119,7 +1198,7 @@ static int handle_connection(HTTPContext *c)
             c->data_count += len;
             if (c->buffer_ptr >= c->buffer_end) {
                 av_freep(&c->pb_buffer);
-				if(c->keep_alive){
+				if(c->keep_alive && c->data_count >= c->total_count){
 					memset(c->buffer, 0, c->buffer_size);
 					c->buffer_ptr = c->buffer;
 				    c->buffer_end = c->buffer + c->buffer_size - 1; 
@@ -1306,6 +1385,9 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 		get_word(info, sizeof(info), &p);
 		c->content_length = atoi(info);
 	}
+	else if(!av_strcasecmp(tmp, "Range:")){
+		get_word(rd->range, sizeof(rd->range), &p);
+	}
 	return 0;
 }
 
@@ -1410,11 +1492,15 @@ static int http_parse_request(HTTPContext *c)
         c->state = HTTPSTATE_RECEIVE_DATA;
         return 0; /*end here*/
 	}else{
-		if(prepare_local_file(c) > 0){
-			c->http_error = 200;
+		if(prepare_local_file(c, &rd) > 0){
 			c->state = HTTPSTATE_SEND_HEADER;
 			return 0; /*no need feed, send local files directly.*/
 		}
+		#if !defined(PLUGIN_DVB)
+		else {
+			goto send_error;
+		}
+		#endif
 		
 		ctx = find_feed(c->url);
 		if(!ctx){
@@ -1544,7 +1630,7 @@ static int http_send_data(HTTPContext *c)
 
     for(;;) {
         if (c->buffer_ptr >= c->buffer_end) {
-            ret = c->hls_idx >= 0 ? hls_read(c) : sff_prepare_data(c);
+            ret = c->hls_idx >= 0 ? hls_read(c) : (c->local_fd < 0 ? sff_prepare_data(c) : local_prepare_data(c));
             if (ret < 0)
                 return -1;
             else if (ret != 0)
@@ -1573,7 +1659,7 @@ static int http_send_data(HTTPContext *c)
 
 static int parse_config(void)
 {
-	my_http_addr.sin_port = htons(80);
+	my_http_addr.sin_port = htons(8080);
 	nb_max_http_connections = 1000;
 	nb_max_connections = 1000;
 	max_bandwidth = 80000;
