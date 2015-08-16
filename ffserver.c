@@ -6,6 +6,7 @@
 
 //#define PLUGIN_DVB
 //#define PLUGIN_SSDP
+#define PLUGIN_DIR 1
 #define FFMPEG_SRC 0
 #define FILE_BUF_SIZE (2*1024*1024)
 
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h> //PRId64
+#include <ctype.h>
 
 #if FFMPEG_SRC == 0
 #include "compact.h"
@@ -187,6 +189,35 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 #if defined(PLUGIN_SSDP)
 #include "plugin_ssdp.c"
 #endif
+
+#if PLUGIN_DIR
+#include "plugin_dir.c"
+#endif
+
+static unsigned hex2int(char c)
+{
+	c = toupper(c);
+	return isdigit(c) ? c - '0' : c - 'A' + 10;
+}
+
+static int url_decode(unsigned char *src)
+{
+	int i, j;
+	for(i = 0, j = 0; src[i]; ){
+		if('%' == src[i]){
+			if(isxdigit(src[i+1]) && isxdigit(src[i+2])){
+				src[j++] = (hex2int(src[i+1])<<4)|hex2int(src[i+2]); 
+				i+=3;
+			}else{
+				src[j++] = src[i++];
+			}
+		}else{
+			src[j++] = src[i++];
+		}
+	}
+	src[j] = 0;
+	return j;
+}
 
 static const char* get_mine_type(char *name)
 {
@@ -1340,6 +1371,7 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	char *p1, tmp[32], info[32];
 	const char *p = line;
 	int len;
+	unsigned char uri[512];
 	
 	get_word(tmp, sizeof(tmp), &p);
 	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST")){
@@ -1350,12 +1382,19 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 		else
 			return -1;
 
-		get_word(c->url, sizeof(c->url), &p);
-		if(c->url[0] == '/'){
-			len = strlen(c->url)-1;
-			memmove(c->url, c->url+1, len); 
-			c->url[len] = 0;
+		get_word(uri, sizeof(uri), &p);
+		http_log("%s '%s'\n", tmp, uri);
+		url_decode(uri);
+		if(uri[0] == '/'){
+			len = strlen(uri)-1;
+			memmove(uri, uri+1, len); 
+			uri[len] = 0;
+			if(len > 0 && uri[len-1] == '/'){
+				uri[len-1] = 0;
+			}
 		}
+		strncpy(c->url, uri, sizeof(c->url)-1);
+
 		if(!c->url[0]){
 			av_strlcpy(c->url, "index.html", sizeof(c->url));
 		}
@@ -1421,6 +1460,13 @@ static int http_parse_request(HTTPContext *c)
 		if(ret < 0)return ret;
 	}
 	is_first = !av_stristr(rd.cookie, first_tag);
+	
+	#if PLUGIN_DIR
+	if(0 == c->post && dir_list_local(c) > 0){
+		c->state = HTTPSTATE_SEND_HEADER;
+		return 0;
+	}
+	#endif
 	
 	if(c->post && c->content_length 
 		&& !av_match_ext(c->url, "m3u8")
