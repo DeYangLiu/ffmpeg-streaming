@@ -279,6 +279,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	len = read(fd, c->pb_buffer + len0, tried);
 	if(len < 0){
 		http_log("local file read err %d\n", len);
+		av_freep(&c->pb_buffer);
 		return 0;
 	}
 
@@ -291,7 +292,8 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		c->http_error = 0;
 		c->total_count = len0 + wanted;
 	}
-	http_log("local file %s size %lld head %lld range '%s'\n", c->url, st.st_size, len0, rd->range);
+	http_log("local file %s size %" PRId64 " head %" PRId64 " range '%s'\n", 
+			c->url, (int64_t)st.st_size, len0, rd->range);
 
     c->buffer_ptr = c->pb_buffer;
     c->buffer_end = c->pb_buffer + len + len0;
