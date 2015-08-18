@@ -109,7 +109,7 @@ typedef struct HTTPContext {
     int64_t timeout;
     struct HTTPContext *next;
 
-    char url[64];
+    char *url;
 	int post;
 	int http_error;
 	int keep_alive; /*whether response has Content-Length.*/
@@ -235,9 +235,51 @@ static int url_decode(unsigned char *src)
 	return j;
 }
 
+static int is_utf8(unsigned char *s)
+{
+	int cnt = 0, err = 0;
+
+	for(; *s; ++s){
+		if((s[0]>>7) == 0){//1 Byte
+			++cnt;
+		}
+		else if((s[0]>>5) == 0x6){// 2 Bytes
+			if((s[1]>>6) == 0x2){
+				s += 1;
+				++cnt;
+			}else{
+				err++;
+			}
+		}
+		else if((s[0]>>4) == 0xE){// 3 Bytes
+			if((s[1] >> 6) == 0x2 && (s[2] >> 6) == 0x2){
+				s += 2;
+				++cnt;
+			}else{
+				err++;
+			}
+		}
+		else if((s[0]>>3) == 0x1E){// 4 Bytes
+			if((s[1] >> 6) == 0x2 && (s[2] >> 6) == 0x2 && (s[3] >> 6) == 0x2){
+				s += 3;
+				++cnt;
+			}else{
+				err++;
+			}
+		}
+	}
+	printf("cnt %d err %d\n", cnt, err);
+	
+	return !err;
+}
+
 static int url_local(unsigned char *utf8, int len)
 {
 	#if defined(_WIN32)
+	if(!is_utf8(utf8)){
+		return 0;
+	}
+
 	int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
 	if(wn <= 0){
 		return 0;
@@ -259,8 +301,8 @@ static int url_local(unsigned char *utf8, int len)
 		utf8[mn] = 0;
 	}
 
-	av_free(wc);
-	av_free(mb);
+	av_freep(&wc);
+	av_freep(&mb);
 	#endif
 	return 1;
 }
@@ -280,6 +322,9 @@ static const char* get_mine_type(char *name)
 		".txt", "text/plain",
 		"", "application/octet-stream",
 	};
+	if(!name){
+		return "";
+	}
 
 	n = sizeof(mm)/sizeof(mm[0]);
 	for(i = 0; i < n; ++i){
@@ -293,7 +338,9 @@ static const char* get_mine_type(char *name)
 static int prepare_local_file(HTTPContext *c, RequestData *rd)
 {/*return 1 if local file exist and can be read to buffer.*/
     int64_t len = 0, len0 = 0;
-	unsigned char tmp[64] = "";
+	unsigned char *tmp = NULL;
+	int tlen = 0;
+	int ret = 0;
 	char prefix[32] = ".";
 	int fd = -1;
 	struct stat st = {0};
@@ -301,14 +348,24 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	int64_t size = 0, wanted = 0, tried = 0;
 	int status = 200;
 	char *msg = "OK";
-
-	snprintf(tmp, sizeof(tmp)-1, "%s/%s",  prefix, c->url);
-	fd = open(tmp, O_RDONLY);
-	if(fd < 0){
+	
+	if(!c->url){
 		return 0;
 	}
-	if((fstat(fd, &st) < 0) || (st.st_size > SIZE_MAX)){
+	tlen = strlen(c->url)+16;
+	tmp = av_malloc(tlen);
+	if(!tmp){
+		http_log("malloc fail for len %d\n", tlen);
 		return 0;
+	}
+
+	snprintf(tmp, tlen, "%s/%s",  prefix, c->url);
+	fd = open(tmp, O_RDONLY);
+	if(fd < 0){
+		goto end;
+	}
+	if((fstat(fd, &st) < 0) || (st.st_size > SIZE_MAX)){
+		goto end;
 	}
 	
 	//Range:bytes=start-end
@@ -333,7 +390,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
         c->buffer_ptr = c->buffer;
         c->buffer_end = c->buffer;
 		close(fd);
-		return 0;
+		goto end;
 	}
 	
 	len0 = sprintf(c->pb_buffer, "HTTP/1.1 %d %s\r\n"
@@ -357,7 +414,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	if(len < 0){
 		http_log("local file read err %d\n", len);
 		av_freep(&c->pb_buffer);
-		return 0;
+		goto end;
 	}
 
 	if(len == wanted){
@@ -374,7 +431,10 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 
     c->buffer_ptr = c->pb_buffer;
     c->buffer_end = c->pb_buffer + len + len0;
-	return 1;
+	ret = 1;
+end:
+	av_freep(&tmp);
+	return ret;
 }
 
 static int local_prepare_data(HTTPContext *c)
@@ -907,7 +967,7 @@ static void log_connection(HTTPContext *c)
     	http_log("%s:%u %d '%s' %" PRId64 " %d %d\n",
              inet_ntoa(c->from_addr.sin_addr), 
 			 ntohs(c->from_addr.sin_port), 
-			 c->post, c->url,
+			 c->post, (c->url ? c->url : "null"),
 			 c->data_count, c->http_error, nb_connections);
 }
 
@@ -1230,7 +1290,8 @@ static void close_connection(HTTPContext *c)
 	if(c->local_fd >= 0){
 		close(c->local_fd);
 	}
-
+	
+	av_freep(&c->url);
     av_freep(&c->pb_buffer);
     av_free(c->buffer);
 	sff_reset(c);
@@ -1401,13 +1462,19 @@ static int get_word(char *buf, int buf_size, const char **pp)
     skip_spaces(&p);
     q = buf;
     while (!av_isspace(*p) && *p != '\0') {
-        if ((q - buf) < buf_size - 1)
+		if(!buf){
+			q++;
+		}
+		else if ((q - buf) < buf_size - 1)
             *q++ = *p;
         p++;
     }
-    if (buf_size > 0)
-        *q = '\0';
-    *pp = p;
+
+	if(buf){
+		if (buf_size > 0)
+			*q = '\0';
+		*pp = p;
+	}
 	return q - buf;
 }
 
@@ -1440,8 +1507,8 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 {
 	char *p1, tmp[32], info[32];
 	const char *p = line;
-	int len;
-	unsigned char uri[512];
+	int len0, len;
+	unsigned char *uri = NULL;
 	
 	get_word(tmp, sizeof(tmp), &p);
 	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST") || !strcmp(tmp, "PUT") || !strcmp(tmp, "DELETE")){
@@ -1453,11 +1520,21 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 			c->post = 3;
 		}else
 			return -1;
-
-		get_word(uri, sizeof(uri), &p);
-		http_log("%s '%s'\n", tmp, uri);
+		
+		len0 = get_word(NULL, 0, &p)+16;
+		if(len0 > 8192){
+			http_log("too long: '%s'\n", p);
+			return -1;	
+		}
+		uri = av_malloc(len0);
+		if(!uri){
+			http_log("malloc fail for uri len %d\n", len0);
+			return -1;
+		}
+		get_word(uri, len0, &p);
+		http_log("%s '%s' len %d\n", tmp, uri, len0);
 		url_decode(uri);
-		url_local(uri, sizeof(uri));
+		url_local(uri, len0);
 
 		if(uri[0] == '/'){
 			len = strlen(uri)-1;
@@ -1467,10 +1544,10 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 				uri[len-1] = 0;
 			}
 		}
-		strncpy(c->url, uri, sizeof(c->url)-1);
+		c->url = uri;
 
 		if(!c->url[0]){
-			av_strlcpy(c->url, "index.html", sizeof(c->url));
+			av_strlcpy(c->url, "index.html", len0);
 		}
 
 		get_word(tmp, sizeof(tmp), &p);
@@ -1535,6 +1612,9 @@ static int http_parse_request(HTTPContext *c)
 	while(get_line(msg, sizeof(msg), &p) > 0){
 		ret = handle_line(c, msg, sizeof(msg), &rd);
 		if(ret < 0)return ret;
+	}
+	if(!c->url){
+		return -1;
 	}
 	is_first = !av_stristr(rd.cookie, first_tag);
 	
