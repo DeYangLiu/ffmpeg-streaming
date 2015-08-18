@@ -8,6 +8,8 @@
 //#define PLUGIN_SSDP
 #define PLUGIN_DIR 1
 #define FFMPEG_SRC 0
+
+#define DIR_UPLOAD_MAX_SIZE ((int64_t)2*1024*1024*1024*1024)
 #define FILE_BUF_SIZE (2*1024*1024)
 
 #define _BSD_SOURCE  /*for struct ip_mreq, must be precede all header files.*/
@@ -111,7 +113,7 @@ typedef struct HTTPContext {
 	int post;
 	int http_error;
 	int keep_alive; /*whether response has Content-Length.*/
-	int content_length;
+	int64_t content_length;
 	int64_t data_count;
     int last_packet_sent; /* true if last data packet was sent */
 	
@@ -142,6 +144,7 @@ typedef struct{/*extra data not in HTTPContext*/
 	char cookie[512];
 	uint8_t content[512];
 	char range[32];
+	char expect[32];
 }RequestData;
 
 static struct sockaddr_in my_http_addr;
@@ -194,6 +197,19 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 #include "plugin_dir.c"
 #endif
 
+static int prepare_response(HTTPContext *c, int code, char *reason)
+{
+	int len = snprintf(c->buffer, c->buffer_size, 
+			"HTTP/1.1 %d %s\r\n"
+			"\r\n\r\n", 
+			code, reason);
+
+	c->buffer_ptr = c->buffer; 
+	c->buffer_end = c->buffer + len;
+	c->state = HTTPSTATE_SEND_HEADER;
+	return 0;
+}
+
 static unsigned hex2int(char c)
 {
 	c = toupper(c);
@@ -217,6 +233,36 @@ static int url_decode(unsigned char *src)
 	}
 	src[j] = 0;
 	return j;
+}
+
+static int url_local(unsigned char *utf8, int len)
+{
+	#if defined(_WIN32)
+	int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+	if(wn <= 0){
+		return 0;
+	}
+
+	wchar_t *wc = (wchar_t *)av_malloc(wn * sizeof(wchar_t));
+	if(!wc){
+		return 0;
+	}
+	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wc, wn);
+
+	int mn = WideCharToMultiByte(CP_ACP, 0, wc, -1, NULL, 0, NULL, NULL);
+	unsigned char *mb = (unsigned char*)av_malloc(mn+1);
+	WideCharToMultiByte(CP_ACP, 0, wc, -1, mb, mn, NULL, NULL);
+	printf("mb '%s' mn %d\n", mb, mn);
+
+	if(mn < len){
+		memcpy(utf8, mb, mn);
+		utf8[mn] = 0;
+	}
+
+	av_free(wc);
+	av_free(mb);
+	#endif
+	return 1;
 }
 
 static const char* get_mine_type(char *name)
@@ -694,6 +740,13 @@ static int http_receive_data(HTTPContext *c)
 		}
 		goto check;
 	}
+	else if(c->local_fd >= 0){
+		len = recv(c->fd, c->buffer, c->buffer_size, 0);
+		if(len > 0){
+			c->data_count += write(c->local_fd, c->buffer, len);
+		}
+		goto check;
+	}
 
 	/*get remains*/	
 	if(sff && sff->size && sff->wpos < sff->size){
@@ -743,12 +796,23 @@ static int http_receive_data(HTTPContext *c)
 check:
 	ret = ff_neterrno();
 	
-	if((len == 0) || (len < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR))){
+	if((len == 0) || (len < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR)
+		|| (0 < c->content_length && c->data_count >= c->content_length)
+		)){
 		//http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
 		if(s){
 			s->flag = 2;
 			//printf("hls get seg %d:%d:%d data %02x %02x %02x %02x\n", c->hls_idx, s->msize, s->csize, s->data[0], s->data[1], s->data[2], s->data[3]);
 		}
+		#if PLUGIN_DIR
+		else if(c->local_fd >= 0){
+			close(c->local_fd);
+			c->local_fd = -1;
+			c->http_error = 200;
+			return prepare_response(c, c->http_error, "OK");
+		}
+		#endif
+
 		wake_others(c, HTTPSTATE_SEND_DATA_TRAILER); 
 		if(s || (c->sff_ref_cnt <= 0))return -1;
 	}
@@ -1162,6 +1226,10 @@ static void close_connection(HTTPContext *c)
     /* remove connection associated resources */
     if (c->fd >= 0)
         close_socket(c->fd);
+	
+	if(c->local_fd >= 0){
+		close(c->local_fd);
+	}
 
     av_freep(&c->pb_buffer);
     av_free(c->buffer);
@@ -1231,7 +1299,11 @@ static int handle_connection(HTTPContext *c)
             c->data_count += len;
             if (c->buffer_ptr >= c->buffer_end) {
                 av_freep(&c->pb_buffer);
-				if(c->keep_alive && c->data_count >= c->total_count){
+				
+				if(100 == c->http_error){
+					c->state = HTTPSTATE_RECEIVE_DATA;
+					c->buffer_ptr = c->buffer_end = c->buffer;
+				} else if(c->keep_alive && c->data_count >= c->total_count){
 					memset(c->buffer, 0, c->buffer_size);
 					c->buffer_ptr = c->buffer;
 				    c->buffer_end = c->buffer + c->buffer_size - 1; 
@@ -1239,14 +1311,12 @@ static int handle_connection(HTTPContext *c)
 				    c->state = HTTPSTATE_WAIT_REQUEST;
 					c->hls_idx = -1;
 					http_log("%u alive %s\n", ntohs(c->from_addr.sin_port), c->url);
-					return 0;
-				}
-                /* if error, exit */
-                if (c->http_error)
+				} else if (c->http_error){/* if error, exit */
                     return -1;
-                /* all the buffer was sent : synchronize to the incoming*/
-                c->state = HTTPSTATE_SEND_DATA_HEADER;
-                c->buffer_ptr = c->buffer_end = c->buffer;
+				} else { /* all the buffer was sent : synchronize to the incoming*/
+					c->state = HTTPSTATE_SEND_DATA_HEADER;
+					c->buffer_ptr = c->buffer_end = c->buffer;
+				}
             }
         }
         break;
@@ -1374,17 +1444,21 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	unsigned char uri[512];
 	
 	get_word(tmp, sizeof(tmp), &p);
-	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST")){
+	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST") || !strcmp(tmp, "PUT") || !strcmp(tmp, "DELETE")){
 		if (tmp[0]== 'G')
 			c->post = 0;
-		else if (tmp[0] == 'P')
-			c->post = 1;
-		else
+		else if (tmp[0] == 'P'){
+			c->post = tmp[1] == 'O' ? 1 : 2;
+		}else if(tmp[0] == 'D'){
+			c->post = 3;
+		}else
 			return -1;
 
 		get_word(uri, sizeof(uri), &p);
 		http_log("%s '%s'\n", tmp, uri);
 		url_decode(uri);
+		url_local(uri, sizeof(uri));
+
 		if(uri[0] == '/'){
 			len = strlen(uri)-1;
 			memmove(uri, uri+1, len); 
@@ -1424,10 +1498,13 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	}
 	else if(!av_strcasecmp(tmp, "Content-Length:")){
 		get_word(info, sizeof(info), &p);
-		c->content_length = atoi(info);
+		c->content_length = strtoll(info, NULL, 10);
 	}
 	else if(!av_strcasecmp(tmp, "Range:")){
 		get_word(rd->range, sizeof(rd->range), &p);
+	}
+	else if(!av_strcasecmp(tmp, "Expect:")){
+		get_word(rd->expect, sizeof(rd->expect), &p);
 	}
 	return 0;
 }
@@ -1464,6 +1541,43 @@ static int http_parse_request(HTTPContext *c)
 	#if PLUGIN_DIR
 	if(0 == c->post && dir_list_local(c) > 0){
 		c->state = HTTPSTATE_SEND_HEADER;
+		return 0;
+	}
+	else if(3 == c->post){
+		if(strncmp(c->url, "upload/", 7)){
+			c->http_error = 403;
+		}else{
+			c->http_error = dir_delete_file(c);
+		}
+		return prepare_response(c, c->http_error, "");
+	}
+	else if((1 == c->post || 2 == c->post) && !strncmp(c->url, "upload/", 7)){
+		char *reason = "";
+		c->http_error = 0;
+		if(!av_strcasecmp(rd.expect, "100-continue")){
+			c->http_error = 100;
+			reason = "continue";
+		}
+
+		if(c->content_length > DIR_UPLOAD_MAX_SIZE){
+			c->http_error = 417;
+			reason = "upload too large file";
+		}else{
+			snprintf(msg, sizeof(msg), "./upload/%s", c->url+7);	
+			c->local_fd = open(msg, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+			if(c->local_fd < 0){
+				http_log("write file '%s' err %d\n", msg, ff_neterrno()); 
+				snprintf(msg, sizeof(msg), "bad file path error %d", ff_neterrno());
+				c->http_error = 417;
+				reason = msg;
+			}
+		}
+
+		if(c->http_error){
+			prepare_response(c, c->http_error, reason);
+		}else{
+			c->state = HTTPSTATE_RECEIVE_DATA;
+		}
 		return 0;
 	}
 	#endif

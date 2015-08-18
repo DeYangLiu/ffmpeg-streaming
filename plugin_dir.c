@@ -65,12 +65,20 @@ static int dir_list_local(HTTPContext *c)
 		return 0;
 	}
 
-	const char *head = 	"HTTP/1.1 200 OK\r\n"
-		    "Connection: close\r\n"
-		    "Content-Type: text/html; charset=utf-8\r\n\r\n";
-	int hlen = strlen(head);
+	char head[512], *charset = "utf-8";
+	#if defined(_WIN32)
+	charset = "gbk"; /*todo: detect from content.*/
+	#endif
+   
+	int hlen;
 	int len = dir2html(path, uri, NULL, 0);
-	
+	hlen = snprintf(head, sizeof(head), 
+			"HTTP/1.1 200 OK\r\n"
+		    "Connection: close\r\n"
+		    "Content-Type: text/html; charset=%s\r\n"
+			"Content-Length: %d\r\n\r\n",
+			charset, len);
+
 	c->pb_buffer = av_malloc(hlen+len);
 	if(!c->pb_buffer){
         c->buffer_ptr = c->buffer;
@@ -85,5 +93,20 @@ static int dir_list_local(HTTPContext *c)
 	c->http_error = 200;
 	c->local_fd = -1;
 	return 1;
+}
+
+static int dir_delete_file(HTTPContext *c)
+{
+	struct stat st;
+	int code = 200;
+	int ret = stat(c->url, &st);
+	if(ret < 0){
+		code = 404;
+	}else{
+		int r2 = remove(c->url);
+		code = r2 ? 400 : 200;
+	}
+
+	return code;
 }
 
