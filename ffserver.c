@@ -141,6 +141,7 @@ typedef struct HTTPContext {
 
 	int local_fd; /*local file handle*/
 	int64_t total_count; /*http header + file size*/
+	int only_header; /*HEAD request*/
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -476,7 +477,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 			c->url, (int64_t)st.st_size, len0, rd->range);
 
     c->buffer_ptr = c->pb_buffer;
-    c->buffer_end = c->pb_buffer + len + len0;
+    c->buffer_end = c->pb_buffer + (c->only_header ? 0 : len) + len0;
 	ret = 1;
 end:
 	av_freep(&tmp);
@@ -1557,13 +1558,16 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	unsigned char *uri = NULL;
 	
 	get_word(tmp, sizeof(tmp), &p);
-	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST") || !strcmp(tmp, "PUT") || !strcmp(tmp, "DELETE")){
+	if(!strcmp(tmp, "GET") || !strcmp(tmp, "POST") || !strcmp(tmp, "PUT") || !strcmp(tmp, "DELETE") || !strcmp(tmp, "HEAD")){
 		if (tmp[0]== 'G')
 			c->post = 0;
 		else if (tmp[0] == 'P'){
 			c->post = tmp[1] == 'O' ? 1 : 2;
 		}else if(tmp[0] == 'D'){
 			c->post = 3;
+		}else if(tmp[0] == 'H'){
+			c->post = 0;
+			c->only_header = 1;
 		}else
 			return -1;
 		

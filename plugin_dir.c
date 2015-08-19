@@ -89,7 +89,7 @@ static int dir_list_local(HTTPContext *c)
 	dir2html(path, uri, c->pb_buffer+hlen, len);
 
 	c->buffer_ptr = c->pb_buffer;
-    c->buffer_end = c->pb_buffer + hlen + len;
+    c->buffer_end = c->pb_buffer + hlen + (c->only_header ? 0 : len);
 	c->http_error = 200;
 	c->local_fd = -1;
 	return 1;
