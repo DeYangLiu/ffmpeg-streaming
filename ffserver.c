@@ -57,6 +57,10 @@
 #include <signal.h>
 //#include <netinet/tcp.h>
 
+#if HAVE_ICONV_H
+#include <iconv.h>
+#endif
+
 
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
@@ -267,14 +271,23 @@ static int is_utf8(unsigned char *s)
 				err++;
 			}
 		}
+		
+		if(err){
+			return 0;
+		}
 	}
-	printf("cnt %d err %d\n", cnt, err);
+	//printf("cnt %d err %d\n", cnt, err);
 	
 	return !err;
 }
 
 static int url_local(unsigned char *utf8, int len)
 {
+	if(!utf8 || len < 1){
+		http_log("bad arg len %d\n", len);
+		return 0;
+	}
+	
 	#if defined(_WIN32)
 	if(!is_utf8(utf8)){
 		return 0;
@@ -287,6 +300,7 @@ static int url_local(unsigned char *utf8, int len)
 
 	wchar_t *wc = (wchar_t *)av_malloc(wn * sizeof(wchar_t));
 	if(!wc){
+		http_log("malloc for local fail\n");
 		return 0;
 	}
 	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wc, wn);
@@ -303,6 +317,38 @@ static int url_local(unsigned char *utf8, int len)
 
 	av_freep(&wc);
 	av_freep(&mb);
+	#elif HAVE_ICONV_H
+	if(is_utf8(utf8)){
+		return 0;
+	}
+	static iconv_t ic_g2u = (iconv_t)-1;
+	iconv_t ic;
+	size_t inlen0, inlen, outlen0, outlen;
+	char *outbuf, *pin, *pout;
+	int ret;
+	
+	if((iconv_t)-1 == ic_g2u){
+		ic_g2u = iconv_open("utf-8", "gbk");
+	}
+	ic = ic_g2u;
+	
+	inlen0 = inlen = strlen(utf8);
+	outlen0 = outlen = inlen*3;
+	pin = (char*)utf8;	
+	pout = outbuf = av_malloc(outlen);
+	if(!pout){
+		http_log("malloc for local fail\n");
+		return 0;
+	}
+	
+	ret = iconv(ic, &pin, &inlen, &pout, &outlen);	
+	if(!ret && !inlen){
+		strncpy(utf8, outbuf, len-1);
+		utf8[len-1] = 0;
+	}else{
+		http_log("conv fail ret %d left in %d\n", ret, (int)inlen);
+	}
+	av_freep(&outbuf);
 	#endif
 	return 1;
 }
