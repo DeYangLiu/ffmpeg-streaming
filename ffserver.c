@@ -1,7 +1,7 @@
 /*
  multiple format streaming server based on the FFmpeg libraries
  mingw: gcc -DFFMPEG_SRC=0 -O0 -g  -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c -lws2_32
- 
+ -DPLUGIN_SSL=1 plugin_ssl.c -lssl -lcrypto 
  */
 
 //#define PLUGIN_DVB
@@ -142,6 +142,9 @@ typedef struct HTTPContext {
 	int local_fd; /*local file handle*/
 	int64_t total_count; /*http header + file size*/
 	int only_header; /*HEAD request*/
+	#if PLUGIN_SSL
+	void* ssl;
+	#endif
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -153,11 +156,12 @@ typedef struct{/*extra data not in HTTPContext*/
 }RequestData;
 
 static struct sockaddr_in my_http_addr;
+static struct sockaddr_in my_https_addr;
 static HTTPContext *first_http_ctx;
 
 static void log_connection(HTTPContext *c);
 
-static void new_connection(int server_fd, int is_rtsp);
+static void new_connection(int server_fd, int flag);
 static void close_connection(HTTPContext *c);
 
 static int handle_connection(HTTPContext *c);
@@ -200,6 +204,12 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 
 #if PLUGIN_DIR
 #include "plugin_dir.c"
+#endif
+
+#if PLUGIN_SSL
+#include "plugin_ssl.h"
+#define recv(fd, buf, len, mode) (c->ssl ? ssl_read(c->ssl, buf, len) : recv(fd, buf, len, mode))
+#define send(fd, buf, len, mode) (c->ssl ? ssl_write(c->ssl, buf, len) : send(fd, buf, len, mode))
 #endif
 
 static int prepare_response(HTTPContext *c, int code, char *reason)
@@ -1055,6 +1065,7 @@ static int socket_open_listen(struct sockaddr_in *my_addr)
 
 static int http_server(void)
 {
+	int ssl_fd = 0;
     int server_fd = 0;
 	int ctrl_fd = 0, ctrl_fd2 = 0;
     int ret, delay;
@@ -1080,8 +1091,18 @@ static int http_server(void)
             return -1;
         }
     }
+	
+	#if PLUGIN_SSL
+	if (my_https_addr.sin_port) {
+        ssl_fd = socket_open_listen(&my_https_addr);
+        if (ssl_fd < 0) {
+            av_free(poll_table);
+            return -1;
+        }
+    }
+	#endif
 
-    if ( !server_fd) {
+    if (!server_fd && !ssl_fd) {
         http_log("HTTP disabled.\n");
         av_free(poll_table);
         return -1;
@@ -1121,6 +1142,14 @@ static int http_server(void)
             poll_entry->events = POLLIN;
             poll_entry++;
         }
+		
+		#if PLUGIN_SSL
+	    if (ssl_fd) {
+            poll_entry->fd = ssl_fd;
+            poll_entry->events = POLLIN;
+            poll_entry++;
+        }
+		#endif
 		
 		#if defined(PLUGIN_SSDP)
 		if(ssdp_fd){
@@ -1208,7 +1237,7 @@ static int http_server(void)
 			poll_entry++;
 		}
 		#endif
-		if(poll_entry->fd != server_fd){
+		if(server_fd && poll_entry->fd != server_fd){
 			printf("bad  entry\n");
 			continue;
 		}
@@ -1218,7 +1247,15 @@ static int http_server(void)
                 new_connection(server_fd, 0);
             poll_entry++;
         }
-		
+
+		#if PLUGIN_SSL
+		if (ssl_fd) {
+            if (poll_entry->revents & POLLIN)
+                new_connection(ssl_fd, 1);
+            poll_entry++;
+        }
+		#endif
+
 		#if defined(PLUGIN_SSDP)
 		if (ssdp_fd) {
             if (poll_entry->revents & POLLIN)
@@ -1230,7 +1267,7 @@ static int http_server(void)
     }
 }
 
-static void http_send_too_busy_reply(int fd)
+static void http_send_too_busy_reply(HTTPContext *c)
 {
     char buffer[400];
     int len = snprintf(buffer, sizeof(buffer),
@@ -1243,12 +1280,12 @@ static void http_send_too_busy_reply(int fd)
                        "</body></html>\r\n",
                        nb_connections, nb_max_connections);
     av_assert0(len < sizeof(buffer));
-    if (send(fd, buffer, len, 0) < len)
+    if (send(c->fd, buffer, len, 0) < len)
         http_log("Could not send too-busy reply, send() failed\n");
 }
 
 
-static void new_connection(int server_fd, int is_rtsp)
+static void new_connection(int server_fd, int flag)
 {
     struct sockaddr_in from_addr;
     socklen_t len;
@@ -1265,6 +1302,16 @@ static void new_connection(int server_fd, int is_rtsp)
         http_log("error during accept %s\n", strerror(errno));
         return;
     }
+	#if PLUGIN_SSL
+	void *ssl = NULL;
+	if(1 == flag){
+		ssl = ssl_open(fd);
+		if(!ssl){
+			http_log("ssl open err %s\n", strerror(errno));
+			goto fail;
+		}
+	}
+	#endif
     if (ff_socket_nonblock(fd, 1) < 0)
         http_log("ff socket set nonblock failed\n");
 	
@@ -1279,11 +1326,6 @@ static void new_connection(int server_fd, int is_rtsp)
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val));
 	#endif
 
-    if (nb_connections >= nb_max_connections) {
-        http_send_too_busy_reply(fd);
-        goto fail;
-    }
-
     /* add a new connection */
     c = av_mallocz(sizeof(HTTPContext));
     if (!c)
@@ -1296,6 +1338,11 @@ static void new_connection(int server_fd, int is_rtsp)
     if (!c->buffer)
         goto fail;
 
+	if (nb_connections >= nb_max_connections) {
+        http_send_too_busy_reply(c);
+        goto fail;
+    }
+
     c->next = first_http_ctx;
     first_http_ctx = c;
     nb_connections++;
@@ -1306,7 +1353,9 @@ static void new_connection(int server_fd, int is_rtsp)
     c->state = HTTPSTATE_WAIT_REQUEST;
 	c->hls_idx = -1;
 	c->local_fd = -1;
-
+	#if PLUGIN_SSL
+	c->ssl = ssl;
+	#endif
     return;
  fail:
     if (c) {
@@ -1331,6 +1380,12 @@ static void close_connection(HTTPContext *c)
     }
 
     /* remove connection associated resources */
+	#if PLUGIN_SSL
+	if(c->ssl){
+		ssl_close(c->ssl);
+		c->ssl = NULL;
+	}
+	#endif
     if (c->fd >= 0)
         close_socket(c->fd);
 	
@@ -1949,9 +2004,44 @@ static int http_send_data(HTTPContext *c)
 }
 
 
-static int parse_config(void)
+static int parse_config(int ac, char **av)
 {
-	my_http_addr.sin_port = htons(8080);
+	int i, tmp;
+	if(1 == ac || (ac > 1 && !strcmp(av[1]+1, "h"))){
+		fprintf(stderr, "usage: -http_port 8080 -https_port 8081 -https_cert server.pem\n"
+				"set port=0 means disable.\n");
+		exit(0);
+	}
+
+	for(i = 1; i < ac; ++i){
+		if('-' == av[i][0] && i < ac-1){
+			if(!strcmp(av[i]+1, "http_port")){
+				tmp = atoi(av[i+1]);
+				my_http_addr.sin_port = htons(tmp);
+			}
+			#if PLUGIN_SSL
+			else if(!strcmp(av[i]+1, "https_port")){
+				tmp = atoi(av[i+1]);
+				my_https_addr.sin_port = htons(tmp);
+			}
+			else if(!strcmp(av[i]+1, "https_cert")){
+				if(ssl_init(av[i+1], av[i+1]) < 0){
+					exit(1);
+				}
+			}
+			#endif
+			else{
+				fprintf(stderr, "unkown option '%s %s'\n", av[i], av[i+1]);
+				exit(1);
+			}
+			++i;
+		}
+		else{
+			fprintf(stderr, "unkown option %s\n", av[i]);
+			exit(1);
+		}
+	}
+	
 	nb_max_http_connections = 1000;
 	nb_max_connections = 1000;
 	max_bandwidth = 80000;
@@ -1976,7 +2066,7 @@ int main(int argc, char **argv)
     //avformat_network_init();
     putenv("http_proxy=");  /* Kill the http_proxy */
 
-	parse_config();
+	parse_config(argc, argv);
 	#if HAVE_WINSOCK2_H
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(1,1), &wsa);
@@ -1989,6 +2079,9 @@ int main(int argc, char **argv)
         http_log("Could not start server\n");
         exit(1);
     }
+	#if PLUGIN_SSL
+	ssl_destroy();
+	#endif
 
     return 0;
 }
