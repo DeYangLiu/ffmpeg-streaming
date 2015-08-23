@@ -2,6 +2,7 @@
  multiple format streaming server based on the FFmpeg libraries
  mingw: gcc -DFFMPEG_SRC=0 -O0 -g  -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c -lws2_32
  -DPLUGIN_SSL=1 plugin_ssl.c -lssl -lcrypto 
+ -DPLUGIN_ZLIB=1 plugin_zlib.c -lz
  */
 
 //#define PLUGIN_DVB
@@ -145,6 +146,9 @@ typedef struct HTTPContext {
 	#if PLUGIN_SSL
 	void* ssl;
 	#endif
+	#if PLUGIN_ZLIB
+	void *z_st;
+	#endif
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -210,6 +214,10 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 #include "plugin_ssl.h"
 #define recv(fd, buf, len, mode) (c->ssl ? ssl_read(c->ssl, buf, len) : recv(fd, buf, len, mode))
 #define send(fd, buf, len, mode) (c->ssl ? ssl_write(c->ssl, buf, len) : send(fd, buf, len, mode))
+#endif
+
+#if PLUGIN_ZLIB
+#include "plugin_zlib.h"
 #endif
 
 static int prepare_response(HTTPContext *c, int code, char *reason)
@@ -424,6 +432,29 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	if((fstat(fd, &st) < 0) || (st.st_size > SIZE_MAX)){
 		goto end;
 	}
+
+	#if PLUGIN_ZLIB
+	if(c->z_st){
+		c->local_fd = fd;
+		c->http_error = 0;
+		c->keep_alive = 0;
+		c->pb_buffer = av_malloc(512);
+		if(!c->pb_buffer){
+			http_log("cant alloc for zlib\n");
+			goto end;
+		}
+		len0 = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
+				"Content-Encoding: gzip\r\n"
+				"Content-type: %s;charset=UTF-8\r\n"
+				"Connection: %s\r\n"
+				"\r\n", 
+				get_mine_type(c->url),
+				(c->keep_alive ? "keep-alive" : "close") );
+		len = 0;
+
+		goto tail;
+	}
+	#endif
 	
 	//Range:bytes=start-end
 	if(!strncmp(rd->range, "bytes=", 6)){
@@ -483,6 +514,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		c->http_error = 0;
 		c->total_count = len0 + wanted;
 	}
+tail:
 	http_log("local file %s size %" PRId64 " head %" PRId64 " range '%s'\n", 
 			c->url, (int64_t)st.st_size, len0, rd->range);
 
@@ -512,8 +544,13 @@ static int local_prepare_data(HTTPContext *c)
 		http_log("%u local-alive %s\n", ntohs(c->from_addr.sin_port), c->url);
 		return 1;
 	}
+	#if PLUGIN_ZLIB
+	if(c->z_st){
+		rlen = zlib_read_compress(read, c->local_fd, c->z_st, c->buffer, c->buffer_size);
+	}else
+	#endif
+		rlen = read(c->local_fd, c->buffer, c->buffer_size);
 
-	rlen = read(c->local_fd, c->buffer, c->buffer_size); 
 	if(rlen <= 0){
 		close(c->local_fd);
 		return -1;
@@ -1380,6 +1417,11 @@ static void close_connection(HTTPContext *c)
     }
 
     /* remove connection associated resources */
+	#if PLUGIN_ZLIB
+	if(c->z_st){
+		zlib_destroy(c->z_st);
+	}
+	#endif
 	#if PLUGIN_SSL
 	if(c->ssl){
 		ssl_close(c->ssl);
@@ -1688,6 +1730,19 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 	else if(!av_strcasecmp(tmp, "Expect:")){
 		get_word(rd->expect, sizeof(rd->expect), &p);
 	}
+	#if PLUGIN_ZLIB
+	else if(!av_strcasecmp(tmp, "Accept-Encoding:")){
+		while((len = get_word(info, sizeof(info), &p)) > 0){
+			if(',' == info[len-1]){
+				info[len-1] = 0;
+			}
+
+			if(!c->z_st && !strcmp(info, "gzip")){
+				c->z_st = zlib_init();
+			}
+		}
+	}
+	#endif
 	return 0;
 }
 
