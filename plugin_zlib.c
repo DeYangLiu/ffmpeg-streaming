@@ -41,7 +41,10 @@ int zlib_destroy(void *z)
 
 int zlib_read_compress(read_fn fn, int fd, void *z, uint8_t *buf, int size)
 {
-	int ret, rd;
+	/*Z_NO_FLUSH cant be used: 
+	it will return 0 in the middle way of compress some big file,
+	whereas it confuse the caller.*/
+	int ret, rd, flag = Z_SYNC_FLUSH; 
 	zlib_t *zl = (zlib_t*)z;
 	z_stream *st = &zl->z_st;
 
@@ -52,12 +55,16 @@ int zlib_read_compress(read_fn fn, int fd, void *z, uint8_t *buf, int size)
 		}else if(rd > 0){
 			st->next_in  = zl->z_buf;
 			st->avail_in = rd;
+		}else if(0 == rd){
+			flag = Z_FINISH;
 		}
 	}
 	st->avail_out = size;
 	st->next_out  = buf;
-	ret = deflate(st, Z_SYNC_FLUSH);
-	if (ret != Z_OK && ret != Z_STREAM_END){
+	ret = deflate(st, flag);
+	
+	if (Z_STREAM_ERROR == ret){
+		printf("zlib ret %d\n", ret);
 		return -1;
 	}
 
