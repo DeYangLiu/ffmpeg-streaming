@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <zlib.h>
+#include "config.h"
 #include "compact.h"
 #include "plugin_zlib.h"
 
