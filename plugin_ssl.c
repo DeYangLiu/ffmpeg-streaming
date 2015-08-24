@@ -81,7 +81,7 @@ int ssl_read(void *sl, unsigned char *buf, int len)
 	n = SSL_read(ssl, buf, len);
 	if(n < 0){
 		if(SSL_get_error(ssl, n) == SSL_ERROR_WANT_READ){
-			printf("ssl continue read ret %d\n", n);
+			n = -11; /*EAGAIN*/
 		}else{
 			n = -1; /*EPERM*/
 		}
@@ -96,7 +96,7 @@ int ssl_write(void *sl, unsigned char *buf, int len)
 	n = SSL_write(ssl, buf, len);
 	if(n < 0){
 		if(SSL_get_error(ssl, n) == SSL_ERROR_WANT_WRITE){
-			printf("ssl continue write ret %d\n", n);
+			n = -11; /*EAGAIN*/
 		}else{
 			n = -1; /*EPERM*/
 		}
