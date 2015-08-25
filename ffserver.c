@@ -154,6 +154,10 @@ typedef struct HTTPContext {
 	#endif
 	int http_version; /*0 -- 1.0, 1 -- 1.1, 2 -- 2.0*/
 	int tr_encoding; /*transfer-encoding method: 1 -- chunked.*/
+	#if PLUGIN_DIR
+	char inm[32]; /*If-None-Match*/
+	char ims[32]; /*If-Modified-Since*/
+	#endif
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -438,6 +442,34 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		goto end;
 	}
 
+	char dt_lm_etag[256] = "";
+	#if PLUGIN_DIR
+	char dt[64] = "", lm[64] = "", etag[64] = "";
+	if(!dir_is_modifed(c, &st, dt, lm, etag, 64)){
+		close(fd);
+		c->http_error = 200;
+		c->local_fd = -1;
+		c->pb_buffer = av_malloc(512);
+		if(!c->pb_buffer){
+			http_log("cant alloc for zlib\n");
+			goto end;
+		}
+
+		len0 = sprintf(c->pb_buffer, "HTTP/1.1 304 Not Modified\r\n"
+				"%s"
+				"Connection: %s\r\n"
+				"\r\n",
+			    dt_lm_etag,	
+				(c->keep_alive ? "keep-alive" : "close") );
+		len = 0;
+
+		goto tail;
+	}else{
+		snprintf(dt_lm_etag, sizeof(dt_lm_etag), 
+				"Cache-Control:max-age=0, must-revalidate\r\nDate: %s\r\nLast-Modified: %s\r\nEtag: %s\r\n", dt, lm, etag);
+	}
+	#endif
+
 	
 	if(c->keep_alive
 		#if PLUGIN_ZLIB
@@ -473,11 +505,13 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		len0 = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
 				"%s%s"
 				"Content-type: %s;charset=UTF-8\r\n"
+				"%s"
 				"Connection: %s\r\n"
 				"\r\n", 
 				content_encoding, transfer_encoding,
 				get_mine_type(c->url),
-				(c->keep_alive ? "keep-alive" : "close") );
+				dt_lm_etag,
+				(c->keep_alive ? "keep-alive" : "close"));
 		len = 0;
 
 		goto tail;
@@ -496,6 +530,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		if(off_end <= 0 || off_end >= st.st_size){
 			off_end = st.st_size - 1;
 		}
+		dt_lm_etag[0] = 0;
 	}
 	wanted = (206 == status ? off_end-off_start+1 : st.st_size);
 	size = FFMIN(wanted + 1024, FILE_BUF_SIZE);
@@ -513,6 +548,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 			"Accept-Ranges: bytes\r\n"
 			"Content-Range: bytes %" PRId64 "-%" PRId64 "/%" PRId64 "\r\n"
 			"Content-Length: %" PRId64 "\r\n"
+			"%s"
 			"Connection: %s\r\n"
 			"\r\n", 
 			status, msg, //200, "OK", 
@@ -521,6 +557,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 			(int64_t)(206 == status ? off_end : st.st_size-1), 
 			(int64_t)st.st_size,
 			(int64_t)(206 == status ? off_end-off_start+1 : st.st_size), 
+			dt_lm_etag,
 			(c->keep_alive ? "keep-alive" : "close") );
 
 	tried = FFMIN(size-len0, wanted);
@@ -1779,6 +1816,21 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 		}
 	}
 	#endif
+	#if PLUGIN_DIR
+	else if(!av_strcasecmp(tmp, "If-None-Match:")){
+		get_word(c->inm, sizeof(c->inm), &p);
+	}
+	else if(!av_strcasecmp(tmp, "If-Modified-Since:")){
+		char *ptr = c->ims;
+		while((len = get_word(info, sizeof(info), &p)) > 0){
+			ptr += sprintf(ptr, "%s ", info);
+		}
+		if(ptr[-1] == ' '){
+			ptr[-1] = 0;
+		}
+	}
+	#endif
+
 	return 0;
 }
 

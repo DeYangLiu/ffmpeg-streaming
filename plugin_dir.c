@@ -110,3 +110,26 @@ static int dir_delete_file(HTTPContext *c)
 	return code;
 }
 
+
+
+static int dir_is_modifed(HTTPContext *c, struct stat *stp, char *dt, char *lm, char *etag, int tag_len)
+{/*return 1 if modifed*/
+	int ret = 0;
+	const char	*fmt = "%a, %d %b %Y %H:%M:%S GMT";
+	time_t tm0;
+	time_t tm = time(NULL);
+	strftime(dt, tag_len, fmt, localtime(&tm));
+	strftime(lm, tag_len, fmt, localtime(&stp->st_mtime));
+	snprintf(etag, tag_len, "\"%lx.%lx\"", (unsigned long)stp->st_mtime, (unsigned long)stp->st_size);
+
+	if(c->inm){
+		ret = strcmp(c->inm, etag) ? 1 : 0;
+	}else if(c->ims && strptime(c->ims, fmt, &tm0)){
+		ret = tm0 < stp->st_mtime < 0 ? 1 : 0;
+	}else{
+		ret = 1;
+	}
+
+	return ret;
+}
+
