@@ -65,6 +65,7 @@
 #endif
 
 
+#define CHUNK_HEAD_LEN 8
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
 #define HTTP_REQUEST_TIMEOUT (15 * 1000)
@@ -151,6 +152,8 @@ typedef struct HTTPContext {
 	#if PLUGIN_ZLIB
 	void *z_st;
 	#endif
+	int http_version; /*0 -- 1.0, 1 -- 1.1, 2 -- 2.0*/
+	int tr_encoding; /*transfer-encoding method: 1 -- chunked.*/
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -435,28 +438,50 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 		goto end;
 	}
 
-	#if PLUGIN_ZLIB
-	if(c->z_st){
+	
+	if(c->keep_alive
+		#if PLUGIN_ZLIB
+		|| c->z_st
+		#endif
+		){
+		char *content_encoding = "";
+		char *transfer_encoding = "";
+
+		c->tr_encoding = c->http_version >= 1 ? 1 : 0;
 		c->local_fd = fd;
 		c->http_error = 0;
-		c->keep_alive = 0;
 		c->pb_buffer = av_malloc(512);
 		if(!c->pb_buffer){
 			http_log("cant alloc for zlib\n");
 			goto end;
 		}
+
+		if(1 == c->tr_encoding){
+			transfer_encoding = "Transfer-Encoding: chunked\r\n";
+		}
+
+		if(0 == c->tr_encoding){
+			c->keep_alive = 0; /*close as boundary*/
+		}
+
+		#if PLUGIN_ZLIB
+		if(c->z_st){
+			content_encoding = "Content-Encoding: gzip\r\n";
+		}
+		#endif
+
 		len0 = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
-				"Content-Encoding: gzip\r\n"
+				"%s%s"
 				"Content-type: %s;charset=UTF-8\r\n"
 				"Connection: %s\r\n"
 				"\r\n", 
+				content_encoding, transfer_encoding,
 				get_mine_type(c->url),
 				(c->keep_alive ? "keep-alive" : "close") );
 		len = 0;
 
 		goto tail;
 	}
-	#endif
 	
 	//Range:bytes=start-end
 	if(!strncmp(rd->range, "bytes=", 6)){
@@ -532,19 +557,20 @@ static int local_prepare_data(HTTPContext *c)
 {
 	int rlen = 0;
 
-	if(c->buffer_end > c->buffer + c->buffer_size){
-		http_log("internal err bad state: buffer_end exceeds buffer\n");
-		return -1;
-	}
-
-	if(c->keep_alive && c->data_count >= c->total_count){
-		memset(c->buffer, 0, c->buffer_size);
-		c->buffer_ptr = c->buffer;
-		c->buffer_end = c->buffer + c->buffer_size - 1; 
+	if(c->keep_alive && ((c->total_count && c->data_count >= c->total_count)
+		|| c->local_fd < 0)){
+		#if PLUGIN_ZLIB
+		if(c->z_st){
+			zlib_destroy(c->z_st);
+			c->z_st = NULL;
+		}
+		#endif
 		c->timeout = cur_time + HTTP_REQUEST_TIMEOUT;
 		c->state = HTTPSTATE_WAIT_REQUEST;
 		http_log("%u local-alive %s\n", ntohs(c->from_addr.sin_port), c->url);
 		return 1;
+	}else if(c->local_fd < 0){
+		return -1;
 	}
 	#if PLUGIN_ZLIB
 	if(c->z_st){
@@ -553,9 +579,12 @@ static int local_prepare_data(HTTPContext *c)
 	#endif
 		rlen = read(c->local_fd, c->buffer, c->buffer_size);
 
-	if(rlen <= 0){
+	if(-11 == rlen){
+		return 2; /*not really change state, jump to next big loop.*/
+	}else if(rlen <= 0){
 		close(c->local_fd);
-		return -1;
+		c->local_fd = -2;
+		if(rlen < 0)return -1;
 	}
 
 	c->buffer_ptr = c->buffer;
@@ -1510,7 +1539,7 @@ static int handle_connection(HTTPContext *c)
 				if(100 == c->http_error){
 					c->state = HTTPSTATE_RECEIVE_DATA;
 					c->buffer_ptr = c->buffer_end = c->buffer;
-				} else if(c->keep_alive && c->data_count >= c->total_count){
+				} else if(c->keep_alive && c->total_count && c->data_count >= c->total_count){
 					memset(c->buffer, 0, c->buffer_size);
 					c->buffer_ptr = c->buffer;
 				    c->buffer_end = c->buffer + c->buffer_size - 1; 
@@ -1700,7 +1729,11 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 		}
 
 		get_word(tmp, sizeof(tmp), &p);
-		if (strcmp(tmp, "HTTP/1.0") && strcmp(tmp, "HTTP/1.1"))
+		if(!strcmp(tmp, "HTTP/1.0"))
+			c->http_version = 0;
+		else if(!strcmp(tmp, "HTTP/1.1"))
+			c->http_version = 1;
+		else 
 			return -1;
 
 		p1 = strchr(c->url, '?');
@@ -1741,6 +1774,7 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 
 			if(!c->z_st && !strcmp(info, "gzip")){
 				c->z_st = zlib_init();
+				break;
 			}
 		}
 	}
@@ -2034,12 +2068,32 @@ static int http_send_data(HTTPContext *c)
 
     for(;;) {
         if (c->buffer_ptr >= c->buffer_end) {
-            ret = c->hls_idx >= 0 ? hls_read(c) : (c->local_fd < 0 ? sff_prepare_data(c) : local_prepare_data(c));
-            if (ret < 0)
+			c->buffer += CHUNK_HEAD_LEN;
+			c->buffer_size -= (CHUNK_HEAD_LEN+2);
+            ret = c->hls_idx >= 0 ? hls_read(c) : (c->local_fd == -1 ? sff_prepare_data(c) : local_prepare_data(c));
+			c->buffer -= CHUNK_HEAD_LEN;
+			c->buffer_size += (CHUNK_HEAD_LEN+2);
+
+			if(1 == c->tr_encoding && 0 == ret){
+				len = snprintf(c->buffer, CHUNK_HEAD_LEN, "%x\r\n", c->buffer_end - c->buffer_ptr);
+				memmove(c->buffer_ptr-len, c->buffer, len);
+				c->buffer_ptr -= len;
+				memcpy(c->buffer_end, "\r\n", 2);
+				c->buffer_end += 2;
+			}
+
+            if (ret < 0){ /*error occured*/
                 return -1;
-            else if (ret != 0)
-                /* state change requested */
-                break;
+			}else if (ret > 0){ /*state change requested */
+				if(c->state == HTTPSTATE_WAIT_REQUEST){
+					memset(c->buffer, 0, c->buffer_size);
+					c->buffer_ptr = c->buffer;
+					c->buffer_end = c->buffer + c->buffer_size - 1;
+				}
+				break;
+			}else if(ret == 0){/*prepare ok*/
+				/*fall through*/
+			}
 		} else {
 			/* TCP data output */
 			len = send(c->fd, c->buffer_ptr, c->buffer_end - c->buffer_ptr, 0);
