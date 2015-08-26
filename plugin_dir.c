@@ -117,13 +117,26 @@ static int dir_is_modifed(HTTPContext *c, struct stat *stp, char *dt, char *lm, 
 	int ret = 0;
 	const char	*fmt = "%a, %d %b %Y %H:%M:%S GMT";
 	time_t tm0;
-	time_t tm = time(NULL);
-	strftime(dt, tag_len, fmt, localtime(&tm));
+	if(dt){
+		time_t tm = time(NULL);
+		strftime(dt, tag_len, fmt, localtime(&tm));
+	}
+	if(!lm || !etag || tag_len < 8+1+1+1){
+		printf("dir bad arg %d\n", tag_len);
+		return ret;
+	}
+
 	strftime(lm, tag_len, fmt, localtime(&stp->st_mtime));
 	snprintf(etag, tag_len, "\"%lx.%lx\"", (unsigned long)stp->st_mtime, (unsigned long)stp->st_size);
 
 	if(c->inm){
-		ret = strcmp(c->inm, etag) ? 1 : 0;
+		if(!strcmp(c->inm, "*")){//always match
+			ret = 0;
+		}else if(!strncmp(c->inm, "W/", 2)){//check sematics
+			ret = strcmp(c->inm+2, etag) ? 1 : 0;
+		}else{//check byte-to-byte
+			ret = strcmp(c->inm, etag) ? 1 : 0;
+		}
 	}else if(c->ims && strptime(c->ims, fmt, &tm0)){
 		ret = tm0 < stp->st_mtime < 0 ? 1 : 0;
 	}else{

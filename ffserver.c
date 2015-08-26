@@ -444,10 +444,13 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 
 	char dt_lm_etag[256] = "";
 	#if PLUGIN_DIR
-	char dt[64] = "", lm[64] = "", etag[64] = "";
-	if(!dir_is_modifed(c, &st, dt, lm, etag, 64)){
+	char lm[64] = "", etag[64] = "";
+	int modified = dir_is_modifed(c, &st, NULL, lm, etag, 64);
+	snprintf(dt_lm_etag, sizeof(dt_lm_etag), 
+			"Cache-Control:max-age=0, must-revalidate\r\nLast-Modified: %s\r\nEtag: %s\r\n", lm, etag);
+	if(!modified){
 		close(fd);
-		c->http_error = 200;
+		c->http_error = 304;
 		c->local_fd = -1;
 		c->pb_buffer = av_malloc(512);
 		if(!c->pb_buffer){
@@ -455,18 +458,16 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 			goto end;
 		}
 
-		len0 = sprintf(c->pb_buffer, "HTTP/1.1 304 Not Modified\r\n"
+		len0 = sprintf(c->pb_buffer, "HTTP/1.1 %d Not Modified\r\n"
 				"%s"
 				"Connection: %s\r\n"
 				"\r\n",
+				c->http_error,
 			    dt_lm_etag,	
 				(c->keep_alive ? "keep-alive" : "close") );
 		len = 0;
 
 		goto tail;
-	}else{
-		snprintf(dt_lm_etag, sizeof(dt_lm_etag), 
-				"Cache-Control:max-age=0, must-revalidate\r\nDate: %s\r\nLast-Modified: %s\r\nEtag: %s\r\n", dt, lm, etag);
 	}
 	#endif
 
@@ -591,7 +592,7 @@ end:
 }
 
 static int local_prepare_data(HTTPContext *c)
-{
+{/*prepare: 0 -- ok, <0 -- err, >0 -- state change*/
 	int rlen = 0;
 
 	if(c->keep_alive && ((c->total_count && c->data_count >= c->total_count)
@@ -2113,7 +2114,6 @@ static int sff_prepare_data(HTTPContext *c)
     return 0;
 }
 
-/* send data starting at c->buffer_ptr to the output connection(either UDP or TCP)*/
 static int http_send_data(HTTPContext *c)
 {
     int len, ret;
@@ -2126,7 +2126,7 @@ static int http_send_data(HTTPContext *c)
 			c->buffer -= CHUNK_HEAD_LEN;
 			c->buffer_size += (CHUNK_HEAD_LEN+2);
 
-			if(1 == c->tr_encoding && 0 == ret){
+			if(1 == c->tr_encoding && 0 == ret){/*transfer: add chunked header and tail*/
 				len = snprintf(c->buffer, CHUNK_HEAD_LEN, "%x\r\n", c->buffer_end - c->buffer_ptr);
 				memmove(c->buffer_ptr-len, c->buffer, len);
 				c->buffer_ptr -= len;
@@ -2147,7 +2147,7 @@ static int http_send_data(HTTPContext *c)
 				/*fall through*/
 			}
 		} else {
-			/* TCP data output */
+			/*send: using tcp or ssl*/
 			len = send(c->fd, c->buffer_ptr, c->buffer_end - c->buffer_ptr, 0);
 			if (len < 0) {
 				if (ff_neterrno() != AVERROR(EAGAIN) &&
