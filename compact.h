@@ -16,7 +16,7 @@
 #endif
 
 #ifndef AV_RB32
-#define AV_RB32(p) (*(uint32_t*)p)
+#define AV_RB32(p) ( (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | (p[3] << 0) )
 #endif
 
 #ifndef FFABS

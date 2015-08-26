@@ -1001,7 +1001,10 @@ static int http_receive_data(HTTPContext *c)
 		
 		recv(c->fd, ptr, 4, 0);
 		size = AV_RB32(ptr); 
-		if(!size || size > 1E6)continue;
+		if(!size || size > 1E6){
+			http_log("sff size error %u\n", size);
+			continue;
+		}
 		
 		c->sff = sff = av_mallocz(sizeof(* c->sff));
 		sff->type = type;
@@ -1912,6 +1915,7 @@ static int http_parse_request(HTTPContext *c)
 	#endif
 	
 	if(c->post && c->content_length 
+		&& strncmp(c->url, "stream/", 7)
 		&& !av_match_ext(c->url, "m3u8")
 		&& !av_match_ext(c->url, "ts")
 		&& !av_match_ext(c->url, "flv")){
@@ -1987,11 +1991,9 @@ static int http_parse_request(HTTPContext *c)
 			c->state = HTTPSTATE_SEND_HEADER;
 			return 0; /*no need feed, send local files directly.*/
 		}
-		#if !defined(PLUGIN_DVB)
-		else {
+		else if(strncmp(c->url, "stream/", 7)){
 			goto send_error;
 		}
-		#endif
 		
 		ctx = find_feed(c->url);
 		if(!ctx){
