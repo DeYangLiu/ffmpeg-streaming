@@ -3,11 +3,12 @@
  mingw: download dll and dev packages from http://ffmpeg.zeranoe.com/builds,
  merge to /e/tools/Player/ffmpeg/, and then invoke:
  
- gcc remuxing.c -g -O0 -o ../remuxing \
+ gcc remuxing.c -g -O0 -o remuxing \
  -I /e/tools/Player/ffmpeg/include \
  -L /e/tools/Player/ffmpeg/lib \
  -lavdevice -lavfilter -lavformat -lavcodec -lpostproc -lswresample -lswscale -lavutil 
-  
+ 
+ linux: -lm -lz -lpthread -lbz2 -lrt -L /usr/lib64 
  */
 
 #include <libavutil/timestamp.h>
@@ -72,7 +73,8 @@ int main(int argc, char **argv)
             ret = AVERROR_UNKNOWN;
             goto end;
         }
-
+		
+		avpriv_set_pts_info(out_stream, in_stream->pts_wrap_bits, in_stream->time_base.num, in_stream->time_base.den);
         ret = avcodec_copy_context(out_stream->codec, in_stream->codec);
         if (ret < 0) {
             fprintf(stderr, "Failed to copy context from input to output stream codec context\n");
@@ -82,11 +84,18 @@ int main(int argc, char **argv)
         if (ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
             out_stream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
     }
+
+	if(out_filename && strstr(out_filename, ".m3u8")){
+		av_opt_set_int(ofmt_ctx, "hls_wrap",  6, AV_OPT_SEARCH_CHILDREN);
+		av_opt_set_int(ofmt_ctx, "hls_list_size",  6, AV_OPT_SEARCH_CHILDREN); 
+		av_opt_set(ofmt_ctx, "hls_time", "1.0", AV_OPT_SEARCH_CHILDREN);
+	}
+
     av_dump_format(ofmt_ctx, 0, out_filename, 1);
 
     if (!(ofmt->flags & AVFMT_NOFILE)) {
 		av_dict_set(&out_opts, "chunked_post", "0", 0);	
-        ret = avio_open2(&ofmt_ctx->pb, out_filename, AVIO_FLAG_WRITE, NULL, &out_opts);
+        ret = avio_open2(&ofmt_ctx->pb, out_filename, AVIO_FLAG_WRITE|AVIO_FLAG_NONBLOCK, NULL, &out_opts);
 
         if (ret < 0) {
             fprintf(stderr, "Could not open output file '%s'", out_filename);
@@ -94,12 +103,14 @@ int main(int argc, char **argv)
         }
     }
 
-    ret = sff_write_header(ofmt_ctx); //avformat_write_header(ofmt_ctx, NULL);
+    ret = ofmt_ctx->pb ? sff_write_header(ofmt_ctx) : avformat_write_header(ofmt_ctx, NULL);
     if (ret < 0) {
         fprintf(stderr, "Error occurred when opening output file\n");
         goto end;
     }
-	avio_flush(ofmt_ctx->pb);
+	if(ofmt_ctx->pb){
+		avio_flush(ofmt_ctx->pb);
+	}
 
     while (1) {
         AVStream *in_stream, *out_stream;
@@ -124,9 +135,11 @@ int main(int argc, char **argv)
         pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
         pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
         pkt.pos = -1;
-
-        ret = sff_write_packet(ofmt_ctx, &pkt); //av_interleaved_write_frame(ofmt_ctx, &pkt);
-		avio_flush(ofmt_ctx->pb);
+		
+		ret = ofmt_ctx->pb ? sff_write_packet(ofmt_ctx, &pkt) : av_interleaved_write_frame(ofmt_ctx, &pkt); 
+		if(ofmt_ctx->pb){
+			avio_flush(ofmt_ctx->pb);
+		}
         if (ret < 0) {
             fprintf(stderr, "Error muxing packet\n");
             break;
@@ -145,8 +158,8 @@ int main(int argc, char **argv)
 		}while(cmp > 0);
 		
     }
-
-    sff_write_packet(ofmt_ctx, NULL); //av_write_trailer(ofmt_ctx);
+	
+	ofmt_ctx->pb ? sff_write_packet(ofmt_ctx, NULL) : av_write_trailer(ofmt_ctx); 
 end:
 
     avformat_close_input(&ifmt_ctx);

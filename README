@@ -39,9 +39,14 @@ ffplay.exe http://server_ip:80/out.m3u8
 
 test case
 ====
-wget -d http://localhost:8090/dir/xx.jpg
-doc/examples/remuxing test.jpg http://localhost:8090/dir/xx.jpg  data
+wget -d http://localhost:8080/stream/xx.jpg
+./remuxing.exe test.jpg http://localhost:8080/stream/xx.jpg  data
 
+ffplay http://localhost:8080/stream/out.avi
+./remuxing.exe music.ts http://localhost:8080/stream/out.avi avi
+
+ffplay http://localhost:8080/stream/out.m3u8
+./remuxing.exe music.ts http://localhost:8080/stream/out.m3u8 hls
 
 [1] http://blog.csdn.net/deyangliu/article/details/39898169
 [2] http://blog.csdn.net/deyangliu/article/details/39187623

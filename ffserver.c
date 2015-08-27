@@ -154,6 +154,7 @@ typedef struct HTTPContext {
 	#endif
 	int http_version; /*0 -- 1.0, 1 -- 1.1, 2 -- 2.0*/
 	int tr_encoding; /*transfer-encoding method: 1 -- chunked.*/
+	int chunk_size; /*post chunked size*/
 	#if PLUGIN_DIR
 	char inm[32]; /*If-None-Match*/
 	char ims[32]; /*If-Modified-Since*/
@@ -942,7 +943,41 @@ static int wake_others(HTTPContext *c, int to)
 	return 0;
 }
 
+static int recv_chunked(HTTPContext *c)
+{/*tcp or ssl recv --> 
+   removed chunk header and tail -->
+   cooked data is in c->buffer+0..len-1.
+   return len = 0 -- eof, >0 -- ok, <0 -- error.
+   */
+	int len = -1;
+	c->buffer_ptr = c->buffer;
+	while(!c->chunk_size && c->buffer_ptr < c->buffer+32){
+		len = recv(c->fd, c->buffer_ptr, 1, 0);
+		if(len <= 0){return -1;}
+		else if(c->buffer_ptr - c->buffer >= 2 &&
+				!memcmp(c->buffer_ptr-1, "\r\n", 2)){
+			c->chunk_size = (int)strtol(c->buffer, NULL, 16);
+			break;
+		}
+		else c->buffer_ptr++;	
+	}
 
+	if(c->buffer_ptr >= c->buffer+32){
+		http_log("missing chunk header\n");
+		return -1;
+	}
+
+	if(c->chunk_size == 0){
+		return 0; /*eof*/
+	}
+	
+	len = recv(c->fd, c->buffer, FFMIN(c->chunk_size, c->buffer_size), 0);
+	if(len > 0){
+		c->chunk_size -= len;
+	}
+
+	return len;
+}
 
 static int http_receive_data(HTTPContext *c)
 {
@@ -957,14 +992,14 @@ static int http_receive_data(HTTPContext *c)
 	}
 
 	if(s){
-		len = recv(c->fd, c->buffer, c->buffer_size, 0);
+		len = c->tr_encoding == 1 ? recv_chunked(c) : recv(c->fd, c->buffer, c->buffer_size, 0);
 		if(len > 0){
 			hls_write(c, c->buffer, len);	
 		}
 		goto check;
 	}
 	else if(c->local_fd >= 0){
-		len = recv(c->fd, c->buffer, c->buffer_size, 0);
+		len = c->tr_encoding == 1 ? recv_chunked(c) : recv(c->fd, c->buffer, c->buffer_size, 0);
 		if(len > 0){
 			c->data_count += write(c->local_fd, c->buffer, len);
 		}
@@ -1834,6 +1869,12 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 		}
 	}
 	#endif
+	else if(!av_strcasecmp(tmp, "Transfer-Encoding:")){
+		get_word(info, sizeof(info), &p);
+		if(!av_strcasecmp(info, "chunked")){
+			c->tr_encoding = 1;
+		}
+	}
 
 	return 0;
 }
