@@ -256,3 +256,84 @@ int av_match_ext(const char *filename, const char *extensions)
         return av_match_name(ext + 1, extensions);
     return 0;
 }
+
+#if HAVE_STRPTIME == 0
+static int get_word(char *src, char *dst)
+{
+	char *p = src;
+	while(*p && isspace(*p)){
+		p++;
+	}
+
+	while(*p && !isspace(*p)){
+		*dst++ = *p++;
+	}
+	*dst = 0;
+	return p - src;
+}
+
+static time_t av_timegm(struct tm *tm)
+{
+    time_t t;
+
+    int y = tm->tm_year + 1900, m = tm->tm_mon + 1, d = tm->tm_mday;
+
+    if (m < 3) {
+        m += 12;
+        y--;
+    }
+
+    t = 86400LL *
+        (d + (153 * m - 457) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 719469);
+
+    t += 3600 * tm->tm_hour + 60 * tm->tm_min + tm->tm_sec;
+
+    return t;
+}
+
+static int get_mon(char *m)
+{
+	static char *name[] = {
+		"",
+		"Jan", "Feb", "Mar",
+		"Apr", "May", "Jun",
+		"Jul", "Aug", "Sep",
+		"Oct", "Nov", "Dec",
+	};
+	int i, n = sizeof(name)/sizeof(name[0]);
+	for(i = 0; i < n; ++i){
+		if(!strcmp(name[i], m)){
+			return i;
+		}
+	}
+	
+	return 0;
+}
+
+char* ff_strptime(const char *str, const char *fmt, time_t *tt)
+{
+	char *p, word[64];
+	struct tm tm = {0};
+	if(strcmp(fmt, "%a, %d %b %Y %H:%M:%S GMT")){
+		printf("not support fmt '%s'\n", fmt);
+		return NULL;
+	}
+
+	p = (char*)str;
+	p += get_word(p, word); //Week
+	p += get_word(p, word); 
+	tm.tm_mday = atoi(word);
+	p += get_word(p, word);
+	tm.tm_mon = get_mon(word) - 1;
+	p += get_word(p, word);
+	tm.tm_year = atoi(word) - 1900;
+
+	p += get_word(p, word);
+	sscanf(word, "%02d:%02d:%02d", &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
+	*tt = av_timegm(&tm);
+	p += get_word(p, word);
+	return p;
+}
+
+#endif
+

@@ -21,11 +21,13 @@ config file -- handwrited sample, can by overwrittten by configure.
 #define HAVE_NANOSLEEP 0
 #define HAVE_GETSYSTEMTIMEASFILETIME 1
 #define HAVE_ICONV_H 0
+#define HAVE_STRPTIME 0
 #else
 #define HAVE_WINSOCK2_H 0
 #define HAVE_POLL_H 1
 #define HAVE_GETTIMEOFDAY 1
 #define HAVE_ICONV_H 1
+#define HAVE_STRPTIME 1
 #endif
 
 

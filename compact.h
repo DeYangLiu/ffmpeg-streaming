@@ -5,6 +5,7 @@
 #include <limits.h> //INT_MAX
 #include <string.h>
 #include <errno.h> //EAGAIN
+#include <time.h> //time_t
 
 #if EDOM > 0
 #define AVERROR(e) (-(e))   ///< Returns a negative error code from a POSIX error code, to return from library functions.
@@ -186,5 +187,9 @@ char *av_asprintf(const char *fmt, ...);
 char *av_d2str(double d);
 char *av_get_token(const char **buf, const char *term);
 
+#if HAVE_STRPTIME == 0
+char* ff_strptime(const char *str, const char *fmt, time_t *tt);
+#define strptime ff_strptime
+#endif
 
 #endif //_COMPACT_H_
