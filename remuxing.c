@@ -3,7 +3,7 @@
  mingw: download dll and dev packages from http://ffmpeg.zeranoe.com/builds,
  merge to /e/tools/Player/ffmpeg/, and then invoke:
  
- gcc remuxing.c -g -O0 -o remuxing \
+ gcc remuxing.c -g -O0  \
  -I /e/tools/Player/ffmpeg/include \
  -L /e/tools/Player/ffmpeg/lib \
  -lavdevice -lavfilter -lavformat -lavcodec -lpostproc -lswresample -lswscale -lavutil 
@@ -18,6 +18,8 @@
 #include "ff_utils.c"
 
 #define M 4
+static int do_sff = 1;
+static int do_rate_emu = 1;
 static int64_t start_time[M], curr_time[M];
 static int64_t first_dts[M] = {0};
 static int64_t curr_dts[M] = {AV_NOPTS_VALUE, AV_NOPTS_VALUE, AV_NOPTS_VALUE, AV_NOPTS_VALUE};
@@ -32,10 +34,16 @@ int main(int argc, char **argv)
     int ret, i, cmp;
 	int cnt = 0;
 
-    if (argc < 3) {
-        printf("usage: remuxing input output fmt\n");
+    if (argc < 4) {
+        printf("usage: remuxing input output fmt [do_sff do_rate_emu]\n");
         return 1;
     }
+	if(argc >= 5){
+		do_sff = atoi(argv[4]);
+	}
+	if(argc >= 6){
+		do_rate_emu = atoi(argv[5]);
+	}
 
     in_filename  = argv[1];
     out_filename = argv[2];
@@ -103,7 +111,7 @@ int main(int argc, char **argv)
         }
     }
 
-    ret = ofmt_ctx->pb ? sff_write_header(ofmt_ctx) : avformat_write_header(ofmt_ctx, NULL);
+    ret = ofmt_ctx->pb && do_sff ? sff_write_header(ofmt_ctx) : avformat_write_header(ofmt_ctx, NULL);
     if (ret < 0) {
         fprintf(stderr, "Error occurred when opening output file\n");
         goto end;
@@ -136,7 +144,7 @@ int main(int argc, char **argv)
         pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
         pkt.pos = -1;
 		
-		ret = ofmt_ctx->pb ? sff_write_packet(ofmt_ctx, &pkt) : av_interleaved_write_frame(ofmt_ctx, &pkt); 
+		ret = ofmt_ctx->pb && do_sff ? sff_write_packet(ofmt_ctx, &pkt) : av_interleaved_write_frame(ofmt_ctx, &pkt); 
 		if(ofmt_ctx->pb){
 			avio_flush(ofmt_ctx->pb);
 		}
@@ -152,14 +160,14 @@ int main(int argc, char **argv)
 			curr_time[i] = av_gettime_relative();
 			cmp = av_compare_ts(curr_dts[i] - first_dts[i], in_stream->time_base, 
 					curr_time[i] - start_time[i], AV_TIME_BASE_Q); 
-			if(cmp <= 0)break;
+			if(!do_rate_emu || cmp <= 0)break;
 			
 			av_usleep(10000);
 		}while(cmp > 0);
 		
     }
 	
-	ofmt_ctx->pb ? sff_write_packet(ofmt_ctx, NULL) : av_write_trailer(ofmt_ctx); 
+	ofmt_ctx->pb && do_sff ? sff_write_packet(ofmt_ctx, NULL) : av_write_trailer(ofmt_ctx); 
 end:
 
     avformat_close_input(&ifmt_ctx);
