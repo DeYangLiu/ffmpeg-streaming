@@ -894,7 +894,7 @@ static SFF* sff_read(HTTPContext *c, int type)
 		return f->sff_pkts[N];
 	}
 
-	if(av_match_ext(c->url, "flv") && FFABS(c->sff_r - f->sff_w) <= 0){
+	if(FFABS(c->sff_r - f->sff_w) <= 0){
 		return NULL;
 	}
 	
@@ -1985,8 +1985,9 @@ static int http_parse_request(HTTPContext *c)
     //http_log("New conn: %s:%u %d %s cookie:%s\n", inet_ntoa(c->from_addr.sin_addr), ntohs(c->from_addr.sin_port), c->post, c->url, rd.cookie);
 
 	/*handle m3u8/ts request solely*/
-	if(av_match_ext(c->url, "m3u8") 
-			|| av_match_ext(c->url, "ts")){
+	if(strncmp(c->url, "stream/", 7)
+		&& (av_match_ext(c->url, "m3u8") 
+			|| av_match_ext(c->url, "ts"))){
 		c->keep_alive = 0; 
 		ret = hls_parse_request(c, c->url, is_first);
 		if(ret < 0)goto send_error;
@@ -2170,7 +2171,7 @@ static int http_send_data(HTTPContext *c)
 			c->buffer_size += (CHUNK_HEAD_LEN+2);
 
 			if(1 == c->tr_encoding && 0 == ret){/*transfer: add chunked header and tail*/
-				len = snprintf(c->buffer, CHUNK_HEAD_LEN, "%x\r\n", c->buffer_end - c->buffer_ptr);
+				len = snprintf(c->buffer, CHUNK_HEAD_LEN, "%lx\r\n", c->buffer_end - c->buffer_ptr);
 				memmove(c->buffer_ptr-len, c->buffer, len);
 				c->buffer_ptr -= len;
 				memcpy(c->buffer_end, "\r\n", 2);
