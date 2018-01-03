@@ -1,10 +1,5 @@
 /*
  multiple format streaming server based on the FFmpeg libraries
- mingw: gcc -DFFMPEG_SRC=0 -O0 -g  -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c \
- -DPLUGIN_SSL=1 plugin_ssl.c -lssl -lcrypto -lws2_32 -lgdi32 \
- -DPLUGIN_ZLIB=1 plugin_zlib.c -lz \
- -I /e/mingw_dgn_lib/third/ -L /e/mingw_dgn_lib/third/ -static 
-
  */
 
 //#define PLUGIN_DVB
