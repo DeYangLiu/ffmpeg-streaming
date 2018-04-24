@@ -48,5 +48,12 @@ ffplay http://localhost:8080/stream/out.avi
 ffplay http://localhost:8080/stream/out.m3u8
 ./remuxing.exe music.ts http://localhost:8080/stream/out.m3u8 hls
 
+
+file_server
+====
+target: cd /data/ && mkdir upload && file_server -http_port 80
+pc: curl --upload-file your-file --url http://192.168.1.102/upload/
+
+
 [1] http://blog.csdn.net/deyangliu/article/details/39898169
 [2] http://blog.csdn.net/deyangliu/article/details/39187623
