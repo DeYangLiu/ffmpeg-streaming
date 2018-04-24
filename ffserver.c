@@ -1,10 +1,5 @@
 /*
  multiple format streaming server based on the FFmpeg libraries
- mingw: gcc -DFFMPEG_SRC=0 -O0 -g  -Werror -Wmissing-prototypes ffserver.c compact.c avstring.c \
- -DPLUGIN_SSL=1 plugin_ssl.c -lssl -lcrypto -lws2_32 -lgdi32 \
- -DPLUGIN_ZLIB=1 plugin_zlib.c -lz \
- -I /e/mingw_dgn_lib/third/ -L /e/mingw_dgn_lib/third/ -static 
-
  */
 
 //#define PLUGIN_DVB
@@ -229,6 +224,34 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 #if PLUGIN_ZLIB
 #include "plugin_zlib.h"
 #endif
+
+static struct in_addr get_host_ip(void)
+{
+	struct in_addr retAddr;
+	memset(&retAddr, 0, sizeof(retAddr));
+	
+	char ac[256] = "";
+	if (gethostname(ac, sizeof(ac))) {
+		return retAddr;
+	}
+	
+	struct hostent *phe = gethostbyname(ac);
+	if (!phe) {
+		return retAddr;
+	}
+	http_log("host: '%s' ip ", ac);
+	
+	int i;
+	for (int i = 0; phe->h_addr_list[i] != 0; ++i) {
+        struct in_addr addr;
+        memcpy(&addr, phe->h_addr_list[i], sizeof(struct in_addr));
+        http_log("%s ", inet_ntoa(addr));
+		memcpy(&retAddr, &addr, sizeof addr);
+    }
+	http_log("\n");
+	
+	return retAddr;
+}
 
 static int prepare_response(HTTPContext *c, int code, char *reason)
 {
@@ -506,7 +529,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 
 		len0 = sprintf(c->pb_buffer, "HTTP/1.1 200 OK\r\n"
 				"%s%s"
-				"Content-type: %s;charset=UTF-8\r\n"
+				"Content-type: %s\r\n"
 				"%s"
 				"Connection: %s\r\n"
 				"\r\n", 
@@ -546,7 +569,7 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	}
 	
 	len0 = sprintf(c->pb_buffer, "HTTP/1.1 %d %s\r\n"
-			"Content-type: %s;charset=UTF-8\r\n"
+			"Content-type: %s\r\n"
 			"Accept-Ranges: bytes\r\n"
 			"Content-Range: bytes %" PRId64 "-%" PRId64 "/%" PRId64 "\r\n"
 			"Content-Length: %" PRId64 "\r\n"
@@ -2034,6 +2057,7 @@ static int http_parse_request(HTTPContext *c)
 			return 0; /*no need feed, send local files directly.*/
 		}
 		else if(strncmp(c->url, "stream/", 7)){
+			snprintf(msg, sizeof(msg), "%s", "404 Not Found");
 			goto send_error;
 		}
 		
@@ -2281,6 +2305,7 @@ int main(int argc, char **argv)
 	#else
     signal(SIGPIPE, SIG_IGN);
 	#endif
+	get_host_ip();
 
     if (http_server() < 0) {
         http_log("Could not start server\n");

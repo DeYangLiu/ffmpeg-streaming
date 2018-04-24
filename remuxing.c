@@ -1,14 +1,6 @@
 /*
  Remux streams from one container format to another.
- mingw: download dll and dev packages from http://ffmpeg.zeranoe.com/builds,
- merge to /e/tools/Player/ffmpeg/, and then invoke:
- 
- gcc remuxing.c -g -O0  \
- -I /e/tools/Player/ffmpeg/include \
- -L /e/tools/Player/ffmpeg/lib \
- -lavdevice -lavfilter -lavformat -lavcodec -lpostproc -lswresample -lswscale -lavutil 
- 
- linux: -lm -lz -lpthread -lbz2 -lrt -L /usr/lib64 
+
  */
 
 #include <libavutil/timestamp.h>
