@@ -59,7 +59,7 @@
 #include <iconv.h>
 #endif
 
-
+#define MIN_SIZE_OF_LOCAL_FILE_FOR_CHUNKED (8*1024)
 #define CHUNK_HEAD_LEN 8
 #define IOBUFFER_INIT_SIZE 8192
 /* timeouts are in ms */
@@ -408,13 +408,16 @@ static int url_local(unsigned char *utf8, int len)
 static const char* get_mine_type(char *name)
 {
 	int i, n;
-	
+
+	//more types: see https://www.iana.org/assignments/media-types/media-types.xhtml
+	//order: longer match first
 	static const char* mm[][2] = {
 		".htm", "text/html",
 		".m3u8", "text/plain",
 		".ts", "video/MP2T",
 		".flv", "video/MP2T",
 		".xml", "text/xml",
+		".css", "text/css",
 		".h", "text/plain",
 		".c", "text/plain",
 		".txt", "text/plain",
@@ -496,11 +499,12 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	#endif
 
 	
-	if(c->keep_alive
+	if( (st.st_size >= MIN_SIZE_OF_LOCAL_FILE_FOR_CHUNKED)
+		&& (c->keep_alive
 		#if PLUGIN_ZLIB
 		|| c->z_st
 		#endif
-		){
+		)){
 		char *content_encoding = "";
 		char *transfer_encoding = "";
 
