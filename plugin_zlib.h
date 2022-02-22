@@ -1,7 +1,7 @@
 #ifndef _PLUGIN_ZLIB_H_
 #define _PLUGIN_ZLIB_H_
-#include <stdint.h>
-typedef ssize_t (*read_fn)(int fd, void *buf, size_t count);
+//#include <stdint.h>
+typedef int (*read_fn)(int fd, void *buf, unsigned int count);
 
 void* zlib_init(void);
 int zlib_destroy(void *z);

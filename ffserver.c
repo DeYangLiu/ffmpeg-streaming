@@ -154,6 +154,7 @@ typedef struct HTTPContext {
 	char inm[32]; /*If-None-Match*/
 	char ims[32]; /*If-Modified-Since*/
 	#endif
+	char xToken[64];
 } HTTPContext;
 
 typedef struct{/*extra data not in HTTPContext*/
@@ -178,12 +179,16 @@ static int http_parse_request(HTTPContext *c);
 static int http_send_data(HTTPContext *c);
 static int http_receive_data(HTTPContext *c);
 
+static int mkdirRecursive(char *path, unsigned int mode);
+
 /* maximum number of simultaneous HTTP connections */
 static unsigned int nb_max_http_connections = 2000;
 static unsigned int nb_max_connections = 5;
 static unsigned int nb_connections;
 static uint64_t max_bandwidth = 1000;
 static int64_t cur_time; 
+
+static char sUploadToken[64];
 
 static FILE *logfile = NULL;
 static void http_log(const char *fmt, ...);
@@ -224,6 +229,77 @@ static int ctl_msg_cb(ctrl_msg_t *msg)
 #if PLUGIN_ZLIB
 #include "plugin_zlib.h"
 #endif
+
+int checkToken(struct HTTPContext *c)
+{
+	return strncmp(c->xToken, sUploadToken, sizeof(c->xToken)-1);
+}
+
+int mkdirRecursive(char *path, unsigned int mode)
+{
+	char *strPath = strdup(path);
+	if (!strPath) {
+		return -1;
+	}
+
+	int ret = 0;
+	char *ptr = strPath;
+	for (; *ptr; ++ptr) {
+		if (ptr > strPath && *ptr == '/') {
+			*ptr = 0;
+			if (access(strPath, F_OK)) {
+				#if HAVE_WINDOWS_H
+				ret = mkdir(strPath);
+				#else
+				ret = mkdir(strPath, mode);
+				#endif
+				if (ret) {
+					http_log("cant mkdir '%s'", strPath);
+					ret = -2;
+					break;
+				}
+				else {
+					//printf("ok mkdir '%s'", strPath));
+				}
+			}
+			else {
+				//printf("exist '%s'", strPath));
+			}
+			*ptr = '/';
+			
+			if (*(ptr+1) == '/') { //skip ...//...
+				++ptr;
+			}
+		}
+	}
+	
+	free(strPath);
+	return ret;
+}
+
+static int preparePathOK(char *path)
+{
+	if (!path) {
+		return 0;
+	}
+
+	struct stat stBuf;
+	int ret = -1;
+
+	ret = stat(path, &stBuf);
+	if (0 == ret) {
+		return 1;
+	}
+
+	if (mkdirRecursive(path, 0777)) {
+		http_log("cant prepare dir '%s'", path);
+	}
+	
+	ret = stat(path, &stBuf);
+	
+	return ret == 0 ? 1 : 0;
+}
+
 
 static struct in_addr get_host_ip(void)
 {
@@ -461,6 +537,9 @@ static int prepare_local_file(HTTPContext *c, RequestData *rd)
 	}
 
 	snprintf(tmp, tlen, "%s/%s",  prefix, c->url);
+
+	http_log("begin open local file %s\n", c->url);
+	
 	fd = open(tmp, O_RDONLY);
 	if(fd < 0){
 		goto end;
@@ -1026,11 +1105,16 @@ static int http_receive_data(HTTPContext *c)
 		goto check;
 	}
 	else if(c->local_fd >= 0){
-		len = c->tr_encoding == 1 ? recv_chunked(c) : recv(c->fd, c->buffer, c->buffer_size, 0);
-		if(len > 0){
-			c->data_count += write(c->local_fd, c->buffer, len);
+		//drain read buffer
+		for (;;) {
+			len = c->tr_encoding == 1 ? recv_chunked(c) : recv(c->fd, c->buffer, c->buffer_size, 0);
+			if (len > 0) {
+				c->data_count += write(c->local_fd, c->buffer, len);
+			}
+			else {
+				goto check;
+			}
 		}
-		goto check;
 	}
 
 	/*get remains*/	
@@ -1083,10 +1167,15 @@ static int http_receive_data(HTTPContext *c)
 
 check:
 	ret = ff_neterrno();
+	//printf("tr_encoding %dlen %d ret 0x%x due %lld recv %lld\n", c->tr_encoding, len, ret, c->content_length, c->data_count);
+
 	
-	if((len == 0) || (len < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR)
+	if((len == 0) 
+		|| (len < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR(EINTR))
 		|| (0 < c->content_length && c->data_count >= c->content_length)
-		)){
+		){
+		//printf("local_fd %d hls %p\n", c->local_fd, s);
+		
 		//http_log("conn end len %d ret %s re_cnt %d\n", len, av_err2str(ret), c->sff_ref_cnt);
 		if(s){
 			s->flag = 2;
@@ -1097,6 +1186,8 @@ check:
 			close(c->local_fd);
 			c->local_fd = -1;
 			c->http_error = 200;
+			//printf("prepare_response\n");
+			
 			return prepare_response(c, c->http_error, "OK");
 		}
 		#endif
@@ -1485,6 +1576,23 @@ static void new_connection(int server_fd, int flag)
 	#endif
     if (ff_socket_nonblock(fd, 1) < 0)
         http_log("ff socket set nonblock failed\n");
+
+	#if 0
+	int tcp_nodelay = 1;
+	if (setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof (tcp_nodelay))) {
+        http_log("setsockopt(TCP_NODELAY) fail");
+    }
+	#endif
+
+	int recv_buffer_size = 500*1024;
+	if (setsockopt (fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer_size, sizeof(recv_buffer_size))) {
+    	http_log("setsockopt(SO_RCVBUF) fail");
+    }
+
+	int send_buffer_size = 500*1024;
+	if (setsockopt (fd, SOL_SOCKET, SO_SNDBUF, &send_buffer_size, sizeof(send_buffer_size))) {
+    	http_log("setsockopt(SO_RCVBUF) fail");
+    }
 	
 	#if	0 /*prevent myself close_wait*/
 	val = 1;
@@ -1634,6 +1742,7 @@ static int handle_connection(HTTPContext *c)
                 goto close_conn;
             }
         } else {
+        	http_log("send len %d\n", len);
             c->buffer_ptr += len;
             c->data_count += len;
             if (c->buffer_ptr >= c->buffer_end) {
@@ -1783,7 +1892,7 @@ static int get_line(char *buf, int buf_size, const char **pp)
 }
 static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *rd)
 {
-	char *p1, tmp[32], info[32];
+	char *p1, tmp[32], info[64];
 	const char *p = line;
 	int len0, len;
 	unsigned char *uri = NULL;
@@ -1902,6 +2011,12 @@ static int handle_line(HTTPContext *c, char *line, int line_size, RequestData *r
 			c->tr_encoding = 1;
 		}
 	}
+	
+	else if(!av_strcasecmp(tmp, "X-TOKEN:")){
+		get_word(info, sizeof(info), &p);
+		strncpy(c->xToken, info, sizeof(c->xToken)-1);
+		c->xToken[sizeof(c->xToken)-1] = 0;
+	}
 
 	return 0;
 }
@@ -1944,14 +2059,14 @@ static int http_parse_request(HTTPContext *c)
 		return 0;
 	}
 	else if(3 == c->post){
-		if(strncmp(c->url, "upload/", 7)){
+		if(strncmp(c->url, "upload/", 7) || checkToken(c)) {
 			c->http_error = 403;
 		}else{
 			c->http_error = dir_delete_file(c);
 		}
 		return prepare_response(c, c->http_error, "");
 	}
-	else if((1 == c->post || 2 == c->post) && !strncmp(c->url, "upload/", 7)){
+	else if((2 == c->post) && !strncmp(c->url, "upload/", 7)){
 		char *reason = "";
 		c->http_error = 0;
 		if(!av_strcasecmp(rd.expect, "100-continue")){
@@ -1962,8 +2077,27 @@ static int http_parse_request(HTTPContext *c)
 		if(c->content_length > DIR_UPLOAD_MAX_SIZE){
 			c->http_error = 417;
 			reason = "upload too large file";
-		}else{
+		}
+		else if (checkToken(c)) {
+			c->http_error = 417;
+			reason = "bad token";
+		}
+		else{
 			snprintf(msg, sizeof(msg), "./upload/%s", c->url+7);	
+
+			#if 0 //disable create dir.
+			char *basePath = strrchr(msg, '/');
+			if (!basePath) {
+				http_log("not full path '%s'\n", basePath);
+				return -1;
+			}
+
+			if (!preparePathOK(basePath)) {
+				http_log("cant prepare base path '%s'\n", basePath);
+				return -1;
+			}
+			#endif
+			
 			c->local_fd = open(msg, O_CREAT|O_WRONLY|O_TRUNC, 0644);
 			if(c->local_fd < 0){
 				http_log("write file '%s' err %d\n", msg, ff_neterrno()); 
@@ -1980,6 +2114,42 @@ static int http_parse_request(HTTPContext *c)
 		}
 		return 0;
 	}
+	else if ((1 == c->post) && !strncmp(c->url, "sign_apk", 8)) {
+		c->content_length = read_request_content(c, rd.content, sizeof(rd.content));
+		if (c->content_length <= 0) {
+			printf("sign apk no content\n");
+			c->http_error = 403;
+			return prepare_response(c, c->http_error, "no content");
+		}
+		else if (checkToken(c)) {
+			printf("sign apk bad token\n");
+			c->http_error = 403;
+			return prepare_response(c, c->http_error, "bad token");
+		}
+		
+		rd.content[c->content_length] = 0;
+		char* path = (char*)rd.content;
+		struct stat stBuf;
+		if (stat(path, &stBuf))
+		{
+			printf("sign apk path %s not exist\n", path);
+			c->http_error = 404;
+			return prepare_response(c, c->http_error, "");
+		}
+		else {
+			char cmd[512] = "";
+			snprintf(cmd, sizeof(cmd)-1, "../sign_apk.sh %s", path);
+			printf("cmd %s\n", cmd);
+			
+			system(cmd);
+			
+			c->http_error = 200;
+			return prepare_response(c, c->http_error, "");
+		}
+		
+		return 0;
+	}
+	
 	#endif
 	
 	if(c->post && c->content_length 
@@ -2265,6 +2435,10 @@ static int parse_config(int ac, char **av)
 				}
 			}
 			#endif
+			else if (!strcmp(av[i]+1, "upload_token")){
+				strncpy(sUploadToken, av[i+1], sizeof(sUploadToken)-1);
+			}
+			
 			else{
 				fprintf(stderr, "unkown option '%s %s'\n", av[i], av[i+1]);
 				exit(1);

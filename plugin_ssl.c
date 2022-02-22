@@ -10,6 +10,7 @@ int ssl_init(char *cert_file, char *private_key)
 {
 	int ret = 0;
 	SSL_library_init();
+	//SSLv23_server_method support TLSv1.0, TLSv1.1, and TLSv1.2.
 	SSL_CTX *ctx = SSL_CTX_new(SSLv23_server_method());/*TLS=SSLv3,TLSv1,TLSv1.1,TLSv1_2*/
 	if(!ctx){
 		printf("alloc ssl ctx fail\n");

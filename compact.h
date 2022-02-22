@@ -81,6 +81,8 @@ int ff_neterrno(void);
 #include <netinet/in.h>
 #include <arpa/inet.h> //inet_ntoa
 #include <netdb.h>
+#include <netinet/tcp.h> //for TCP_NODELAY
+
 #define close_socket close
 #define ff_neterrno() AVERROR(errno)
 #endif /* HAVE_WINSOCK2_H */
